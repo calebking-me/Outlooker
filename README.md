@@ -1,6 +1,7 @@
 Outlooker.py watches the NWS Storm Prediction Center’s convective outlooks for a county and posts an alert to your Slack alerts channel when the risk is new or goes up. It can also post the full output of every outlook check to a separate Slack logs channel. The default is Montgomery County, TN, and you can pick another county.
 
 Setup: Copy outlooker.example.ini to outlooker.ini next to Outlooker.py and paste in your Slack webhook URL(s). After that, python3 Outlooker.py runs with no command-line options or environment variables. Command-line options and environment variables still work and override the file. Keep outlooker.ini private: the webhook URLs are secrets, and .gitignore keeps the file out of git.
+Running on GitHub: .github/workflows/outlooker.yml runs the script every 30 minutes on GitHub Actions, so no computer has to stay on. Add the SLACK_ALERTS_WEBHOOK_URL secret (and SLACK_LOGS_WEBHOOK_URL for the logs channel) under Settings > Secrets and variables > Actions; the setup steps are at the top of the workflow file.
 Outlooks checked: Days 1–3 categorical risk and Days 1–2 tornado probability, with Conservative Impact Group (CIG) intensity levels when a tornado risk is present.
 Alert thresholds: It alerts at Slight or higher, or at a tornado probability of 5% or more. It pings @channel for Enhanced or higher on Day 1 or 2, or for a tornado probability of 10% or more.
 Message contents: Times appear in both Z and Central. Each message links to the SPC outlooks page and ends with the updated disclaimer.

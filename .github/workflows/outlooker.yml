@@ -1,0 +1,82 @@
+# Runs Outlooker.py on GitHub's servers every 30 minutes, so no computer of yours has
+# to stay on.
+#
+# Setup (repository Settings > Secrets and variables > Actions):
+#   Secrets:   SLACK_ALERTS_WEBHOOK_URL   the alerts channel webhook (required)
+#              SLACK_LOGS_WEBHOOK_URL     the logs channel webhook (optional; when set,
+#                                         every run posts its full output there)
+#   Variables: SPC_COUNTY_FIPS, or SPC_COUNTY and SPC_STATE (optional; the default
+#              is Montgomery County, TN)
+#
+# Schedules only run from the default branch (main). Run it by hand from the Actions
+# tab with "Run workflow"; choose test-webhook first to check both channels.
+name: Outlooker
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"  # every 30 minutes (UTC), off the busy top of the hour
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to run
+        type: choice
+        default: check
+        options: [check, test-webhook, test-alert, dry-run]
+
+permissions:
+  contents: read
+
+# Never let two runs overlap: they would race on the state file.
+concurrency:
+  group: outlooker
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The state file (what has already been alerted) and the county outline are
+      # carried from run to run in GitHub's cache. Without the state file every run
+      # would repeat the same alert.
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            spc_county_alert_state_*.json
+            county_*.geojson
+          key: outlooker-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: outlooker-state-
+
+      - name: Check SPC outlooks
+        env:
+          SLACK_ALERTS_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          SLACK_LOGS_WEBHOOK_URL: ${{ secrets.SLACK_LOGS_WEBHOOK_URL }}
+          SPC_COUNTY_FIPS: ${{ vars.SPC_COUNTY_FIPS }}
+          SPC_COUNTY: ${{ vars.SPC_COUNTY }}
+          SPC_STATE: ${{ vars.SPC_STATE }}
+          MODE: ${{ inputs.mode || 'check' }}
+        run: |
+          case "$MODE" in
+            check)        python3 Outlooker.py ;;
+            test-webhook) python3 Outlooker.py --test-webhook ;;
+            test-alert)   python3 Outlooker.py --test-alert ;;
+            dry-run)      python3 Outlooker.py --dry-run ;;
+          esac
+
+      # Saved even when the check step failed: an alert may have gone out before a
+      # later step failed, and losing that record would send it again.
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            spc_county_alert_state_*.json
+            county_*.geojson
+          key: outlooker-state-${{ github.run_id }}-${{ github.run_attempt }}
