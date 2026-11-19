@@ -14,7 +14,7 @@ name: Outlooker
 
 on:
   schedule:
-    - cron: "7,37 * * * *"  # every 30 minutes (UTC), off the busy top of the hour
+    - cron: "*/5 * * * *"  # every 5 minutes
   workflow_dispatch:
     inputs:
       mode:
