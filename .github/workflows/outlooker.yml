@@ -1,12 +1,15 @@
-# Runs Outlooker.py on GitHub's servers every 30 minutes, so no computer of yours has
+# Runs Outlooker.py on GitHub's servers every 15 minutes, so no computer of yours has
 # to stay on.
 #
-# Setup (repository Settings > Secrets and variables > Actions):
-#   Secrets:   SLACK_ALERTS_WEBHOOK_URL   the alerts channel webhook (required)
-#              SLACK_LOGS_WEBHOOK_URL     the logs channel webhook (optional; when set,
-#                                         every run posts its full output there)
-#   Variables: SPC_COUNTY_FIPS, or SPC_COUNTY and SPC_STATE (optional; the default
-#              is Montgomery County, TN)
+# Settings: outlooker.actions.ini in this repository (counties, hail, wind, lowered
+# risk messages and so on). Edit it and commit; the next run uses it.
+# Secrets (repository Settings > Secrets and variables > Actions), never in that file:
+#   SLACK_ALERTS_WEBHOOK_URL   the alerts channel webhook (required)
+#   SLACK_LOGS_WEBHOOK_URL     the logs channel webhook (optional; when set, every run
+#                              posts its full output there)
+#   OUTLOOKER_HEARTBEAT_URL    requested after every run, for a monitoring service
+#                              such as healthchecks.io (optional)
+#   OUTLOOKER_FAILURE_URL      requested when a run has a problem (optional)
 #
 # Schedules only run from the default branch (main). Run it by hand from the Actions
 # tab with "Run workflow"; choose test-webhook first to check both channels.
@@ -21,7 +24,7 @@ on:
         description: What to run
         type: choice
         default: check
-        options: [check, test-webhook, test-alert, dry-run]
+        options: [check, test-webhook, test-alert, test-heartbeat, dry-run]
 
 permissions:
   contents: read
@@ -58,16 +61,16 @@ jobs:
         env:
           SLACK_ALERTS_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
           SLACK_LOGS_WEBHOOK_URL: ${{ secrets.SLACK_LOGS_WEBHOOK_URL }}
-          SPC_COUNTY_FIPS: ${{ vars.SPC_COUNTY_FIPS }}
-          SPC_COUNTY: ${{ vars.SPC_COUNTY }}
-          SPC_STATE: ${{ vars.SPC_STATE }}
+          OUTLOOKER_HEARTBEAT_URL: ${{ secrets.OUTLOOKER_HEARTBEAT_URL }}
+          OUTLOOKER_FAILURE_URL: ${{ secrets.OUTLOOKER_FAILURE_URL }}
           MODE: ${{ inputs.mode || 'check' }}
         run: |
           case "$MODE" in
-            check)        python3 Outlooker.py ;;
-            test-webhook) python3 Outlooker.py --test-webhook ;;
-            test-alert)   python3 Outlooker.py --test-alert ;;
-            dry-run)      python3 Outlooker.py --dry-run ;;
+            check)          python3 Outlooker.py --config outlooker.actions.ini ;;
+            test-webhook)   python3 Outlooker.py --config outlooker.actions.ini --test-webhook ;;
+            test-alert)     python3 Outlooker.py --config outlooker.actions.ini --test-alert ;;
+            test-heartbeat) python3 Outlooker.py --config outlooker.actions.ini --test-heartbeat ;;
+            dry-run)        python3 Outlooker.py --config outlooker.actions.ini --dry-run ;;
           esac
 
       # Saved even when the check step failed: an alert may have gone out before a
