@@ -1,9 +1,12 @@
-Outlooker.py watches the NWS Storm Prediction Center’s convective outlooks for a county and posts an alert to your Slack alerts channel when the risk is new or goes up. It can also post the full output of every outlook check to a separate Slack logs channel. The default is Montgomery County, TN, and you can pick another county.
+Outlooker.py watches the NWS Storm Prediction Center’s convective outlooks for one or more counties and posts an alert to your Slack alerts channel when the risk is new or goes up. It can also post the full output of every outlook check to a separate Slack logs channel. The default is Montgomery County, TN, and you can pick other counties.
 
-Outlooks checked: Days 1–3 categorical risk and Days 1–2 tornado probability, with Conditional Intensity Group (CIG) intensity levels when a tornado risk is present.
-Alert thresholds: It alerts at Slight or higher, or at a tornado probability of 5% or more. It pings @channel for Enhanced or higher on Day 1 or 2, or for a tornado probability of 10% or more.
+Outlooks checked: Days 1–3 categorical risk and Days 1–2 tornado probability, with Conditional Intensity Group (CIG) intensity levels when a tornado risk is present. Optionally, Days 1–2 hail and damaging wind probability too, each with its own CIG intensity levels.
+Alert thresholds: It alerts at Slight or higher, or at a tornado probability of 5% or more. It pings @channel for Enhanced or higher on Day 1 or 2, or for a tornado probability of 10% or more. Hail and wind alert at the probability and intensity levels you set (by default 15% or CIG1), and ping only at levels you choose.
+Several counties: Each [location NAME] section in the settings file adds a county to the same check, with its own alerts. NAME, such as Home or Work, appears in the messages.
+Lowered risks: Optionally, the alerts channel also hears when a risk it was alerted about is lowered, drops below the alert threshold, or is removed from the outlook.
 Message contents: Times appear in both Z and Central. Each message links to the SPC outlooks page and ends with the updated disclaimer.
 Logs channel: Optional. When it is turned on, every outlook check (every normal run, not the test options) posts its full output to the logs channel, whether or not there is anything to report. Alerts still go to the alerts channel. The logs channel never pings anyone.
+Heartbeat: Optional. After every check it can request a URL for a monitoring service such as healthchecks.io, which warns you if the checks stop, plus a second URL when a check has a problem.
 Repeat alerts: A state file for each county stops it from repeating alerts.
 Dependencies: It uses only the Python standard library.
-Testing: Built-in --test-county and --test-webhook options let you check your setup before relying on it. --test-webhook sends a test message to the alerts channel and, when it is turned on, to the logs channel.
+Testing: Built-in --test-county, --test-webhook and --test-heartbeat options let you check your setup before relying on it. --test-webhook sends a test message to the alerts channel and, when it is turned on, to the logs channel.
