@@ -1,0 +1,8 @@
+# Your settings: they hold the Slack webhook URLs, which are secrets.
+outlooker.ini
+
+# Files the script writes next to itself.
+spc_county_alert.log*
+spc_county_alert_state*
+county_*.geojson
+__pycache__/

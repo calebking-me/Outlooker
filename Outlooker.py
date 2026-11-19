@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
-spc_county_alert.py
-===================
+Outlooker.py
+============
 
 Checks the NWS Storm Prediction Center (SPC) convective outlooks for a U.S. county
-(Montgomery County, Tennessee by default) and posts an alert to a Slack channel
-through an Incoming Webhook.
+(Montgomery County, Tennessee by default) and posts an alert to a Slack channel, the
+alerts channel, through an Incoming Webhook. It can also post the full output of
+every run to a second Slack channel, the logs channel.
+
+Settings file
+-------------
+The script reads its settings from outlooker.ini in the same folder as the script,
+so a scheduled run needs no command-line options or environment variables. Copy
+outlooker.example.ini to outlooker.ini and fill it in; the example explains each
+setting. --config FILE reads a different file instead (for example, one per county).
+* Command-line options win over environment variables, which win over the settings
+  file. A blank setting uses the default.
+* Relative paths in the settings file are relative to the folder the file is in.
+* An unknown section or setting is reported as an error, so a typo is not ignored.
+* The file holds the webhook URLs, which are secrets. Keep it private and out of
+  version control (the repository's .gitignore excludes outlooker.ini).
 
 Choosing the county
 -------------------
@@ -14,8 +28,10 @@ Choosing the county
   work; the state may be an abbreviation, a full name or a 2-digit FIPS code).
 * By code:  --fips 47037   (5-digit county FIPS code: 2 digits state + 3 digits county).
 * Not sure of the spelling?  --list-counties --state TN
-* The same choices can come from environment variables SPC_COUNTY + SPC_STATE, or
-  SPC_COUNTY_FIPS. Command-line options win over environment variables.
+* The same choices can come from the [county] section of the settings file, or from
+  environment variables SPC_COUNTY + SPC_STATE, or SPC_COUNTY_FIPS. The county is
+  taken as a whole from the first of these that names one: command line, then
+  environment variables, then settings file.
 * SPC outlooks cover the contiguous United States only.
 
 Names are looked up with the U.S. Census Bureau. If a name matches more than one
@@ -36,12 +52,12 @@ A hazard counts for the county when ANY part of the county touches a shaded area
 The script tests the county's full boundary polygon against every outlook polygon,
 not a single point, and reports the highest level that touches the county.
 
-When it sends to Slack
-----------------------
+When it sends to the alerts channel
+-----------------------------------
 * Every shaded area that touches the county is written to the log file.
-* A Slack message is sent only for a categorical risk of Slight or higher, or a
-  tornado probability of 5% or higher, and only when that risk is new or has
-  increased since the last alert for the same outlook period (see "State file").
+* An alert is sent to the alerts channel only for a categorical risk of Slight or
+  higher, or a tornado probability of 5% or higher, and only when that risk is new or
+  has increased since the last alert for the same outlook period (see "State file").
 * A tornado CIG is included whenever that day's tornado probability is being
   reported (5% or higher). A new or higher CIG counts as an increase in risk and
   sends a message; on its own it does not ping the channel.
@@ -52,6 +68,22 @@ When it sends to Slack
   increases. If a risk that was already reported reaches the ping window without
   increasing (for example a Day 3 Enhanced Risk that becomes the Day 2 outlook),
   the script sends one message to deliver the ping.
+
+Logs channel
+------------
+When the logs channel is turned on ([logs-channel] in the settings file), every
+outlook check posts its full output - the same lines written to the console and the
+log file - to the logs channel, whether or not there was anything to report. Alerts
+still go to the alerts channel as described above.
+* The output is posted as a code block under a one-line status: finished OK, with
+  warnings, or with errors. It never pings anyone: Slack mentions such as <!channel>
+  that appear in the output are shown as plain text.
+* An unusually long output is shortened in the middle to fit in one Slack message;
+  the full output is always in the log file.
+* The run log is posted after the alert. If it cannot be posted, the error is logged
+  and the exit code is 1; the alert has already been sent.
+* --test-webhook sends a test message to both channels. The other test options do not
+  post to the logs channel, and --dry-run prints the run log instead of posting it.
 
 State file
 ----------
@@ -65,21 +97,24 @@ counties can be monitored by separate scheduled runs.
 
 Testing the setup
 -----------------
-    --test-webhook   send a short test message to Slack to confirm the webhook works
-    --test-alert     send a sample alert (clearly marked TEST, made-up data) so you can
-                     see the formatting; add --test-ping to include the @channel ping
+    --test-webhook   send a short test message to the alerts channel, and to the logs
+                     channel when it is turned on, to confirm the webhooks work
+    --test-alert     send a sample alert (clearly marked TEST, made-up data) to the
+                     alerts channel so you can see the formatting; add --test-ping to
+                     include the @channel ping
     --test-county    show which county was selected and its boundary details
-    --dry-run        run the real check but print the message instead of sending it
+    --dry-run        run the real check but print the messages instead of sending them
 None of the test options read or change the state file. The offline unit tests are
 in test_spc_county_alert.py (python -m unittest -v test_spc_county_alert).
 
 Slack webhook handling
 ----------------------
-The webhook URL is checked before use (must be https, no stray spaces or quotes) and
-is never written to the log; logs show only https://hooks.slack.com/****. Slack's
-documented error codes (for example channel_not_found or channel_is_archived) are
-translated into plain-language advice. Rate limiting (HTTP 429), Slack server errors
-(5xx) and network failures are retried up to 3 times; other errors are not.
+Each webhook URL is checked before use (must be https, with no stray spaces, quotes or
+invisible characters) and is never written to the log or posted to the logs channel;
+logs show only https://hooks.slack.com/****. Slack's documented error codes (for
+example channel_not_found or channel_is_archived) are translated into plain-language
+advice. Rate limiting (HTTP 429), Slack server errors (5xx) and network failures are
+retried up to 3 times; other errors are not.
 
 Data sources
 ------------
@@ -93,22 +128,31 @@ Data sources
 Requirements and setup
 ----------------------
 * Python 3.9+, standard library only. On Windows, also run: pip install tzdata
-* Create a Slack app with Incoming Webhooks enabled and add a webhook for your
-  channel. Put the URL in the SLACK_WEBHOOK_URL environment variable. The URL is a
-  secret: keep it out of shared files and version control.
-* Check the webhook:  python spc_county_alert.py --test-webhook
+* Create a Slack app with Incoming Webhooks enabled and add a webhook for your alerts
+  channel. To use the logs channel, add a second webhook for that channel.
+* Copy outlooker.example.ini to outlooker.ini next to this script and paste in the
+  webhook URL(s). The URLs are secrets: keep them out of shared files and version
+  control.
+* Check the webhooks:  python3 Outlooker.py --test-webhook
 * Run it on a schedule, for example every 30 minutes with cron:
-    */30 * * * * SLACK_WEBHOOK_URL=https://hooks.slack.com/services/... \\
-                 /usr/bin/python3 /path/to/spc_county_alert.py
+    */30 * * * * /usr/bin/python3 /path/to/Outlooker.py
+* The webhook URLs can come from environment variables instead
+  (SLACK_ALERTS_WEBHOOK_URL, SLACK_LOGS_WEBHOOK_URL) or from the command line
+  (--alerts-channel-webhook, --logs-channel-webhook). The earlier names
+  SLACK_WEBHOOK_URL and --webhook still work for the alerts channel.
 
 Other options
 -------------
-    --no-ping      never ping the channel (handy while testing in a real channel)
-    --spc-base     URL or local folder to read the SPC files from (for testing)
-    -v             verbose (debug) logging
+    --config FILE       read the settings from FILE instead of outlooker.ini
+    --no-ping           never ping the channel (handy while testing in a real channel)
+    --no-logs-channel   do not post to the logs channel on this run (--logs-channel
+                        posts to it on this run even if the settings file turns it off)
+    --spc-base          URL or local folder to read the SPC files from (for testing)
+    -v                  verbose (debug) logging
 
-Exit codes: 0 = success; 1 = something failed (details in the log). A run in which
-one outlook file failed still reports the outlooks that did load.
+Exit codes: 0 = success; 1 = something failed (details in the log); 2 = a mistake in
+the command-line options or the settings file. A run in which one outlook file failed
+still reports the outlooks that did load.
 
 Disclaimer: this script was written with AI assistance. Verify all information on
 the SPC website. It must not be used as a primary means of receiving severe weather
@@ -117,6 +161,7 @@ alerts.
 from __future__ import annotations
 
 import argparse
+import configparser
 import difflib
 import json
 import logging
@@ -128,7 +173,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -138,6 +183,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # --------------------------------------------------------------------------- #
 DEFAULT_COUNTY_FIPS = "47125"  # Montgomery County, Tennessee
 LEGACY_STATE_FILE = "spc_county_alert_state.json"  # name used before county selection
+CONFIG_FILE = "outlooker.ini"  # settings file, read from the script's folder by default
+
+# The sections and settings the settings file may contain (see outlooker.example.ini).
+CONFIG_SETTINGS = {
+    "county": ("fips", "county", "state"),
+    "alerts-channel": ("webhook", "ping"),
+    "logs-channel": ("enabled", "webhook"),
+    "options": ("verbose", "log-file", "state-file", "cache-dir"),
+}
 
 # Census TIGERweb Counties layer. outSR=4326 returns longitude/latitude, which is
 # what the SPC files use.
@@ -228,7 +282,16 @@ SLACK_ATTEMPTS = 3        # tries for rate limits, Slack server errors and netwo
 SLACK_TIMEOUT = 15        # seconds per try
 SLACK_MAX_RETRY_WAIT = 60  # cap on a Retry-After wait, seconds
 
-_NEW_WEBHOOK = "Create a new webhook in your Slack app and update SLACK_WEBHOOK_URL."
+# The two Slack channels. Alerts go to the alerts channel; the full output of every
+# outlook check goes to the logs channel when it is turned on.
+ALERTS_CHANNEL = "alerts channel"
+LOGS_CHANNEL = "logs channel"
+# Longer run logs are shortened in the middle. Slack truncates messages at 40,000
+# characters and recommends far fewer, so this stays well below that.
+LOGS_MAX_CHARS = 12_000
+
+_NEW_WEBHOOK = ("Create a new webhook in your Slack app and update the webhook URL in "
+                "your settings.")
 # Plain-language explanations of Slack's documented Incoming Webhook error codes.
 SLACK_ERROR_HELP = {
     "invalid_payload": "Slack could not read the message body.",
@@ -289,6 +352,10 @@ class DataError(Exception):
 
 class SlackError(RuntimeError):
     """Raised when a message could not be delivered to Slack. Never contains the URL."""
+
+
+class ConfigError(Exception):
+    """Raised when the settings file cannot be read or contains a mistake."""
 
 
 # --------------------------------------------------------------------------- #
@@ -856,9 +923,13 @@ def check_webhook(url: str | None) -> str | None:
     than hooks.slack.com is allowed but logged as a warning.
     """
     if not url:
-        return "No Slack webhook URL. Set SLACK_WEBHOOK_URL or pass --webhook."
-    if any(c in url for c in " \t\r\n\"'<>"):
-        return "The Slack webhook URL contains spaces or quote marks; copy it again from Slack."
+        return (f"No webhook URL is set. Add it to {CONFIG_FILE} (see outlooker.example.ini) "
+                "or pass it on the command line.")
+    # Invisible characters usually come from copying and pasting. Control characters
+    # would also make Python's error message quote the secret URL.
+    if any(c in " \"'<>" or not (c.isascii() and c.isprintable()) for c in url):
+        return ("The Slack webhook URL contains spaces, quote marks or invisible characters; "
+                "copy it again from Slack.")
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return "The Slack webhook URL is not a valid web address."
@@ -931,23 +1002,28 @@ def post_to_slack(webhook_url: str, text: str, *, timeout: float = SLACK_TIMEOUT
     raise SlackError("unreachable")
 
 
-def deliver(args: argparse.Namespace, text: str, what: str) -> int:
-    """Print (dry run) or send a message. Returns an exit code."""
+def deliver(args: argparse.Namespace, text: str, what: str,
+            channel: str = ALERTS_CHANNEL) -> int:
+    """Print (dry run) or send a message to the alerts or logs channel.
+
+    Returns an exit code.
+    """
     if args.dry_run:
         print(text)
-        log.info("Dry run: %s printed, not sent", what)
+        log.info("Dry run: the %s for the %s was printed, not sent", what, channel)
         return 0
-    problem = check_webhook(args.webhook)
+    webhook = args.logs_webhook if channel == LOGS_CHANNEL else args.alerts_webhook
+    problem = check_webhook(webhook)
     if problem:
-        log.error("Cannot send the %s: %s", what, problem)
+        log.error("Cannot send the %s to the %s: %s", what, channel, problem)
         return 1
-    log.info("Sending the %s to %s", what, mask_webhook(args.webhook))
+    log.info("Sending the %s to the %s (%s)", what, channel, mask_webhook(webhook))
     try:
-        post_to_slack(args.webhook, text)
+        post_to_slack(webhook, text)
     except SlackError as exc:
-        log.error("Sending the %s failed: %s", what, exc)
+        log.error("Sending the %s to the %s failed: %s", what, channel, exc)
         return 1
-    log.info("The %s was sent to Slack", what)
+    log.info("The %s was sent to the %s", what, channel)
     return 0
 
 
@@ -1099,15 +1175,20 @@ def build_message(county_label: str, entries: list[tuple[Hazard, str, str | None
     return "\n".join(lines)
 
 
-def build_test_webhook_message(county_label: str, now: datetime, tz: ZoneInfo | None) -> str:
-    """A short message that confirms the webhook works. Never pings."""
+def build_test_webhook_message(county_label: str, now: datetime, tz: ZoneInfo | None,
+                               channel: str = ALERTS_CHANNEL) -> str:
+    """A short message that confirms a channel's webhook works. Never pings."""
     sent = fmt_utc(now)
     if tz:
         sent = f"{fmt_local(now, tz)} ({sent})"
+    if channel == LOGS_CHANNEL:
+        purpose = "The full output of every outlook check will be posted here."
+    else:
+        purpose = "Alerts will be posted here when a risk reaches the alert threshold."
     return "\n".join([
         f"*Test message from the SPC outlook alert script for {county_label}*",
-        "If you can read this, the Slack webhook is working. This is not a weather "
-        "alert; no outlook data was checked.",
+        f"If you can read this, the {channel} webhook is working. {purpose} "
+        "This is not a weather alert; no outlook data was checked.",
         f"Sent {sent}",
         "",
         f"SPC outlooks: <{SPC_OUTLOOKS_PAGE}|{SPC_OUTLOOKS_PAGE}>",
@@ -1137,6 +1218,60 @@ def build_test_alert(county_label: str, now: datetime, tz: ZoneInfo | None, ping
     banner = ("*TEST MESSAGE - sample data, not a real forecast.* "
               "This shows what an alert looks like. Check SPC for the actual outlook.")
     return banner + "\n\n" + build_message(county_label, sample_entries(now), ping, tz, [])
+
+
+def slack_escape(text: str) -> str:
+    """Make text show literally in Slack.
+
+    '<', '>' and '&' start Slack's control sequences, such as <!channel> (which pings
+    everyone) and links, so they are replaced with entities that Slack shows as-is.
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def shorten_middle(text: str, limit: int) -> str:
+    """Fit text into about `limit` characters by cutting whole lines from the middle.
+
+    The start and the end (where a run's outcome is) are kept.
+    """
+    if len(text) <= limit:
+        return text
+    budget = max(limit - 200, 0)  # room for the note
+    head = text[: budget // 3]
+    if "\n" in head:
+        head = head[: head.rindex("\n") + 1]
+    tail = text[len(text) - (budget - len(head)):]
+    if "\n" in tail:
+        tail = tail[tail.index("\n") + 1:]
+    omitted = text[len(head): len(text) - len(tail)]
+    lines = omitted.count("\n")
+    amount = f"{lines} line{'s' if lines != 1 else ''}" if lines else f"{len(omitted)} characters"
+    note = (f"[... {amount} left out here to fit in one Slack message; "
+            "the full output is in the log file ...]")
+    if head and not head.endswith("\n"):
+        head += "\n"
+    return f"{head}{note}\n{tail}"
+
+
+def build_run_log_message(lines: list[str], exit_code: int, highest_level: int,
+                          webhooks: tuple = ()) -> str:
+    """The logs channel message: a status line, then the run's output as a code block.
+
+    Any of the given webhook URLs found in the output are masked, and the output is
+    escaped so that nothing in it can ping the channel or turn into a link.
+    """
+    if exit_code or highest_level >= logging.ERROR:
+        status = "finished with errors"
+    elif highest_level >= logging.WARNING:
+        status = "finished with warnings"
+    else:
+        status = "finished OK"
+    output = "\n".join(lines) or "(no output)"
+    for url in webhooks:
+        if url:
+            output = output.replace(url, mask_webhook(url))
+    output = shorten_middle(slack_escape(output), LOGS_MAX_CHARS)
+    return f"*SPC outlook check* - {status}\n```\n{output}\n```"
 
 
 # --------------------------------------------------------------------------- #
@@ -1230,11 +1365,11 @@ def run(args: argparse.Namespace, now: datetime | None = None) -> int:
     for hazard in hazards:
         if hazard.kind == CIG:
             if (hazard.day, hazard.period_key) not in reported_tornado:
-                log.info("Logged only, tornado probability below the Slack threshold: %s",
+                log.info("Logged only, tornado probability below the alert threshold: %s",
                          hazard.short())
                 continue
         elif not hazard.alertable:
-            log.info("Below the Slack threshold, logged only: %s", hazard.short())
+            log.info("Below the alert threshold, logged only: %s", hazard.short())
             continue
 
         record = periods.get(hazard.period_key, {})
@@ -1262,12 +1397,13 @@ def run(args: argparse.Namespace, now: datetime | None = None) -> int:
     exit_code = 1 if failed else 0
 
     if not entries:
-        log.info("No Slight-or-higher or 5%%-or-higher tornado risk touches %s; nothing to send",
-                 county.label)
+        log.info("No Slight-or-higher or 5%%-or-higher tornado risk touches %s; "
+                 "nothing to send to the alerts channel", county.label)
         return exit_code
     ping = ping_due and not args.no_ping
     if not changed and not ping:
-        log.info("Risk has not increased since the last alert; nothing sent")
+        log.info("Risk has not increased since the last alert; nothing sent to the alerts "
+                 "channel")
         return exit_code
 
     message = build_message(county.label, entries, ping, tz, failed)
@@ -1278,7 +1414,7 @@ def run(args: argparse.Namespace, now: datetime | None = None) -> int:
         log.info("Dry run: message not sent and state not saved")
         return exit_code
 
-    if deliver(args, message, "alert") != 0:
+    if deliver(args, message, "alert", ALERTS_CHANNEL) != 0:
         return 1  # the state is not saved, so the next run will try again
 
     # Remember the highest level reported (and pinged) for each outlook period.
@@ -1311,10 +1447,18 @@ def _county_label_best_effort(args: argparse.Namespace) -> str:
 
 
 def run_test_webhook(args: argparse.Namespace, now: datetime | None = None) -> int:
-    """--test-webhook: send a short message that confirms Slack delivery."""
+    """--test-webhook: send a short message to each channel to confirm Slack delivery."""
     now = now or datetime.now(timezone.utc)
-    text = build_test_webhook_message(_county_label_best_effort(args), now, get_local_tz())
-    return deliver(args, text, "test message")
+    county_label, tz = _county_label_best_effort(args), get_local_tz()
+    exit_code = 0
+    for channel in (ALERTS_CHANNEL, LOGS_CHANNEL):
+        if channel == LOGS_CHANNEL and not args.logs_channel:
+            log.info("The logs channel is turned off, so it was not tested")
+            continue
+        text = build_test_webhook_message(county_label, now, tz, channel)
+        if deliver(args, text, "test message", channel) != 0:
+            exit_code = 1
+    return exit_code
 
 
 def run_test_alert(args: argparse.Namespace, now: datetime | None = None) -> int:
@@ -1322,7 +1466,8 @@ def run_test_alert(args: argparse.Namespace, now: datetime | None = None) -> int
     now = now or datetime.now(timezone.utc)
     ping = args.test_ping and not args.no_ping
     text = build_test_alert(_county_label_best_effort(args), now, get_local_tz(), ping)
-    return deliver(args, text, "sample alert" + (" (with channel ping)" if ping else ""))
+    return deliver(args, text, "sample alert" + (" (with channel ping)" if ping else ""),
+                   ALERTS_CHANNEL)
 
 
 def run_test_county(args: argparse.Namespace) -> int:
@@ -1342,6 +1487,7 @@ def run_test_county(args: argparse.Namespace) -> int:
         f"Extent:     lat {min_lat:.3f} to {max_lat:.3f}, lon {min_lon:.3f} to {max_lon:.3f}",
         f"Cache file: {county_cache_path(args.cache_dir, county.geoid)}",
         f"State file: {state_path_for(args, county)}",
+        f"Settings:   {args.config or '(no settings file; using options and defaults)'}",
     ]
     if county.geoid[:2] in OUTSIDE_SPC_COVERAGE:
         lines.append("Note:       SPC outlooks do not cover this state.")
@@ -1364,13 +1510,155 @@ def run_list_counties(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Settings file
+# --------------------------------------------------------------------------- #
+def _setting_name(name: str) -> str:
+    """Section and setting names ignore case, and '_' works in place of '-'."""
+    return name.strip().lower().replace("_", "-")
+
+
+def _unquote(value: str) -> str:
+    """Remove one pair of matching quotes, which people often put around URLs."""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1].strip()
+    return value
+
+
+def _mask_urls(text: str) -> str:
+    """Mask web addresses in an error message that may quote a line of the file."""
+    return re.sub(r"https?://[^\s'\"]+", lambda m: mask_webhook(m.group()), text)
+
+
+def read_config(path: Path) -> dict[str, dict[str, str]]:
+    """Read the settings file into {section: {setting: value}}, leaving out blank values.
+
+    Raises ConfigError if the file cannot be read or has an unknown section or setting,
+    so that a typo is reported instead of quietly ignored.
+    """
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=(";", "#"))
+    parser.optionxform = _setting_name
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            parser.read_file(handle)
+    except OSError as exc:
+        raise ConfigError(f"cannot read the settings file {path}: {exc.strerror or exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"the settings file {path} is not UTF-8 text: {exc}") from exc
+    except configparser.Error as exc:
+        raise ConfigError(f"the settings file {path} has a mistake in it: "
+                          f"{_mask_urls(str(exc))}") from exc
+
+    settings: dict[str, dict[str, str]] = {}
+    for section in parser.sections():
+        name = _setting_name(section)
+        if name not in CONFIG_SETTINGS:
+            known = ", ".join(f"[{s}]" for s in CONFIG_SETTINGS)
+            raise ConfigError(f"unknown section [{section}] in {path}; the sections are {known}")
+        if name in settings:
+            raise ConfigError(f"section [{section}] appears twice in {path}")
+        settings[name] = {}
+        for key, value in parser.items(section):
+            if key not in CONFIG_SETTINGS[name]:
+                raise ConfigError(f"unknown setting '{key}' in [{section}] of {path}; the "
+                                  f"settings there are {', '.join(CONFIG_SETTINGS[name])}")
+            value = _unquote(value.strip())
+            if value:
+                settings[name][key] = value
+    return settings
+
+
+@dataclass(frozen=True)
+class Config:
+    """What the settings file says. Empty when there is no settings file."""
+    path: Path | None = None
+    values: dict = field(default_factory=dict)  # {section: {setting: value}}
+
+    def text(self, section: str, key: str) -> str | None:
+        return self.values.get(section, {}).get(key)
+
+    def flag(self, section: str, key: str) -> bool | None:
+        """A yes/no setting, or None if it is not set."""
+        value = self.text(section, key)
+        if value is None:
+            return None
+        flag = configparser.ConfigParser.BOOLEAN_STATES.get(value.lower())
+        if flag is None:
+            raise ConfigError(f"'{key}' in [{section}] of {self.path} must be yes or no, "
+                              f"not {value!r}")
+        return flag
+
+    def path_setting(self, section: str, key: str) -> Path | None:
+        """A file or folder setting. A relative path is relative to the settings file."""
+        value = self.text(section, key)
+        if value is None:
+            return None
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else self.path.parent / path
+
+
+def load_config(path: Path | None, script_dir: Path) -> Config:
+    """Read the given settings file, or else outlooker.ini next to the script if it exists."""
+    if path is None:
+        path = script_dir / CONFIG_FILE
+        if not path.exists():
+            return Config()
+    elif not path.exists():
+        raise ConfigError(f"settings file {path} not found")
+    return Config(path, read_config(path))
+
+
+def _first(*values: str | None) -> str | None:
+    """The first value that is not blank, with spaces trimmed; None if all are blank."""
+    for value in values:
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def apply_settings(args: argparse.Namespace, config: Config) -> None:
+    """Fill in what the command line left out: from environment variables, then the
+    settings file, then the defaults. (The county is chosen in parse_args.)
+
+    Raises ConfigError for a setting with a bad value.
+    """
+    env = os.environ
+    # Read every yes/no setting first, so a bad value is reported even when a
+    # command-line option makes it irrelevant for this run.
+    ping = config.flag("alerts-channel", "ping")
+    logs_enabled = config.flag("logs-channel", "enabled")
+    verbose = config.flag("options", "verbose")
+
+    args.alerts_webhook = _first(args.alerts_webhook, env.get("SLACK_ALERTS_WEBHOOK_URL"),
+                                 env.get("SLACK_WEBHOOK_URL"),  # the earlier name
+                                 config.text("alerts-channel", "webhook"))
+    args.logs_webhook = _first(args.logs_webhook, env.get("SLACK_LOGS_WEBHOOK_URL"),
+                               config.text("logs-channel", "webhook"))
+    if args.logs_channel is None:  # neither --logs-channel nor --no-logs-channel
+        args.logs_channel = bool(args.logs_webhook) if logs_enabled is None else logs_enabled
+    args.no_ping = args.no_ping or ping is False
+    args.verbose = args.verbose or bool(verbose)
+    args.log_file = (args.log_file or config.path_setting("options", "log-file")
+                     or args.script_dir / "spc_county_alert.log")
+    args.state_file = args.state_file or config.path_setting("options", "state-file")
+    args.cache_dir = (args.cache_dir or config.path_setting("options", "cache-dir")
+                      or args.script_dir)
+
+
+# --------------------------------------------------------------------------- #
 # Command line
 # --------------------------------------------------------------------------- #
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     here = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(
         description="Alert a Slack channel to SPC convective outlook risks for a county "
-                    "(default: Montgomery County, TN).")
+                    "(default: Montgomery County, TN).",
+        epilog=f"Settings can also come from {CONFIG_FILE} next to this script (copy "
+               "outlooker.example.ini to start) and from environment variables. "
+               "Command-line options win over environment variables, which win over the "
+               "settings file.")
+    p.add_argument("--config", type=Path, metavar="FILE",
+                   help=f"Settings file to read (default: {CONFIG_FILE} next to this "
+                        "script, if there is one)")
     where = p.add_argument_group("county (default: Montgomery County, TN)")
     where.add_argument("--county", help="County name, e.g. 'Davidson' (needs --state; "
                                         "env SPC_COUNTY)")
@@ -1378,11 +1666,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     where.add_argument("--fips", help="5-digit county FIPS code, e.g. 47037 "
                                       "(env SPC_COUNTY_FIPS)")
 
+    slack = p.add_argument_group("Slack channels")
+    slack.add_argument("--alerts-channel-webhook", dest="alerts_webhook", metavar="URL",
+                       help="Incoming Webhook URL for the alerts channel, which gets the "
+                            "alerts (env SLACK_ALERTS_WEBHOOK_URL)")
+    slack.add_argument("--webhook", dest="alerts_webhook", help=argparse.SUPPRESS)  # old name
+    slack.add_argument("--logs-channel-webhook", dest="logs_webhook", metavar="URL",
+                       help="Incoming Webhook URL for the logs channel, which gets the full "
+                            "output of every run (env SLACK_LOGS_WEBHOOK_URL)")
+    slack.add_argument("--logs-channel", action=argparse.BooleanOptionalAction,
+                       help="Post this run's output to the logs channel, or not (default: "
+                            "as the settings file says, else yes when a logs channel "
+                            "webhook is set)")
+    slack.add_argument("--no-ping", action="store_true",
+                       help="Never ping the alerts channel")
+
     modes = p.add_argument_group("tests and tools (only one at a time)").add_mutually_exclusive_group()
     modes.add_argument("--test-webhook", action="store_true",
-                       help="Send a short test message to Slack and exit")
+                       help="Send a short test message to the alerts channel, and to the "
+                            "logs channel when it is on, then exit")
     modes.add_argument("--test-alert", action="store_true",
-                       help="Send a sample alert marked TEST (made-up data) and exit")
+                       help="Send a sample alert marked TEST (made-up data) to the alerts "
+                            "channel and exit")
     modes.add_argument("--test-county", action="store_true",
                        help="Show the selected county and its boundary, then exit")
     modes.add_argument("--list-counties", action="store_true",
@@ -1390,14 +1695,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--test-ping", action="store_true",
                    help="With --test-alert, include the @channel ping")
 
-    p.add_argument("--webhook", default=os.environ.get("SLACK_WEBHOOK_URL"),
-                   help="Slack Incoming Webhook URL (default: env SLACK_WEBHOOK_URL)")
-    p.add_argument("--state-file", type=Path, default=None,
+    p.add_argument("--state-file", type=Path,
                    help="Remembers what has been reported (default: "
                         "spc_county_alert_state_<FIPS>.json next to this script)")
-    p.add_argument("--log-file", type=Path, default=here / "spc_county_alert.log",
-                   help="Log file, rotated at 1 MB with 5 backups (default: next to this script)")
-    p.add_argument("--cache-dir", type=Path, default=here,
+    p.add_argument("--log-file", type=Path,
+                   help="Log file, rotated at 1 MB with 5 backups (default: "
+                        "spc_county_alert.log next to this script)")
+    p.add_argument("--cache-dir", type=Path,
                    help="Folder for cached county outlines (default: next to this script)")
     p.add_argument("--refresh-county", action="store_true",
                    help="Download the county outline again even if it is cached")
@@ -1405,37 +1709,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="URL or local folder holding the SPC outlook files (default: SPC website)")
     p.add_argument("--dry-run", action="store_true",
                    help="Print messages instead of sending them; do not save state")
-    p.add_argument("--no-ping", action="store_true", help="Never ping the channel")
     p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     args = p.parse_args(argv)
     args.script_dir = here
 
-    # Environment variables apply only when no county option was given on the command line.
+    try:
+        config = load_config(args.config, here)
+        apply_settings(args, config)
+    except ConfigError as exc:
+        p.error(str(exc))
+    args.config = config.path  # None when there is no settings file
+
+    # The county is taken as a whole from the first place that names one: the command
+    # line, then the environment variables, then the settings file.
+    county_from = ""
     if args.county is None and args.state is None and args.fips is None:
-        args.county = os.environ.get("SPC_COUNTY") or None
-        args.state = os.environ.get("SPC_STATE") or None
-        args.fips = os.environ.get("SPC_COUNTY_FIPS") or None
+        names = ("SPC_COUNTY", "SPC_STATE", "SPC_COUNTY_FIPS")
+        from_env = [os.environ.get(name) or None for name in names]
+        from_file = [config.text("county", key) for key in ("county", "state", "fips")]
+        if any(from_env):
+            args.county, args.state, args.fips = from_env
+            county_from = "the environment variables " + ", ".join(names)
+        elif any(from_file):
+            args.county, args.state, args.fips = from_file
+            county_from = f"[county] in {config.path}"
+
+    def county_error(message: str) -> None:
+        if county_from:
+            message += f". The county settings came from {county_from}"
+        p.error(message)
 
     if args.state is not None:
         try:
             args.state = parse_state(args.state)
         except ValueError as exc:
-            p.error(str(exc))
+            county_error(str(exc))
 
     if args.list_counties:
         if not args.state:
-            p.error("--list-counties needs --state")
+            county_error("--list-counties needs --state")
     elif args.fips and (args.county or args.state):
-        p.error("use either --fips or --county with --state, not both")
+        county_error("use either --fips or --county with --state, not both")
     elif args.county and not args.state:
-        p.error("--county needs --state (for example --county Davidson --state TN)")
+        county_error("--county needs --state (for example --county Davidson --state TN)")
     elif args.state and not args.county:
-        p.error("--state needs --county (or use --list-counties to see the names)")
+        county_error("--state needs --county (or use --list-counties to see the names)")
 
     if args.fips:
         args.fips = args.fips.strip()
         if not re.fullmatch(r"\d{5}", args.fips) or args.fips[:2] not in STATE_BY_FIPS:
-            p.error(f"--fips must be a 5-digit county FIPS code such as 47125, not {args.fips!r}")
+            county_error(f"--fips must be a 5-digit county FIPS code such as 47125, "
+                         f"not {args.fips!r}")
         args.county_spec = CountySpec(geoid=args.fips)
     elif args.county:
         args.county_spec = CountySpec(name=args.county.strip(), state=args.state)
@@ -1445,16 +1769,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.test_ping and not args.test_alert:
         p.error("--test-ping only works with --test-alert")
     needs_webhook = not (args.test_county or args.list_counties or args.dry_run)
-    if needs_webhook and not args.webhook:
-        p.error("a webhook is required: set SLACK_WEBHOOK_URL or pass --webhook "
-                "(or use --dry-run)")
-    if args.webhook:
-        args.webhook = args.webhook.strip()
+    if needs_webhook and not args.alerts_webhook:
+        if args.config:
+            where = f"add webhook = <URL> under [alerts-channel] in {args.config}"
+        else:
+            where = (f"copy outlooker.example.ini to {here / CONFIG_FILE} and paste the "
+                     "URL in as the [alerts-channel] webhook")
+        p.error(f"the alerts channel needs a Slack webhook URL: {where} (or set "
+                "SLACK_ALERTS_WEBHOOK_URL, pass --alerts-channel-webhook, or use --dry-run)")
     return args
 
 
-def setup_logging(log_file: Path, verbose: bool) -> None:
-    """Log to a rotating file and to the console."""
+class RunLog(logging.Handler):
+    """Keeps a copy of this run's log lines, to post to the logs channel."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+        self.highest = logging.NOTSET  # the most severe level logged so far
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.lines.append(self.format(record))
+        except Exception:  # a logging problem must never stop the run
+            self.handleError(record)
+            return
+        self.highest = max(self.highest, record.levelno)
+
+
+def setup_logging(log_file: Path, verbose: bool) -> RunLog:
+    """Log to a rotating file and to the console, and keep a copy for the logs channel."""
     level = logging.DEBUG if verbose else logging.INFO
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     log.setLevel(level)
@@ -1465,27 +1809,51 @@ def setup_logging(log_file: Path, verbose: bool) -> None:
     file_handler = logging.handlers.RotatingFileHandler(
         log_file, maxBytes=1_000_000, backupCount=5, encoding="utf-8")
     console = logging.StreamHandler()
-    for handler in (file_handler, console):
+    run_log = RunLog()
+    for handler in (file_handler, console, run_log):
         handler.setFormatter(fmt)
         log.addHandler(handler)
+    return run_log
+
+
+def send_run_log(args: argparse.Namespace, run_log: RunLog, exit_code: int) -> int:
+    """Post the full output of this run to the logs channel. Returns an exit code."""
+    text = build_run_log_message(run_log.lines, exit_code, run_log.highest,
+                                 (args.alerts_webhook, args.logs_webhook))
+    return deliver(args, text, "run log", LOGS_CHANNEL)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    setup_logging(args.log_file, args.verbose)
+    run_log = setup_logging(args.log_file, args.verbose)
+    if args.config:
+        log.debug("Settings read from %s", args.config)
+    if args.test_webhook:
+        task = run_test_webhook
+    elif args.test_alert:
+        task = run_test_alert
+    elif args.test_county:
+        task = run_test_county
+    elif args.list_counties:
+        task = run_list_counties
+    else:
+        task = run
     try:
-        if args.test_webhook:
-            return run_test_webhook(args)
-        if args.test_alert:
-            return run_test_alert(args)
-        if args.test_county:
-            return run_test_county(args)
-        if args.list_counties:
-            return run_list_counties(args)
-        return run(args)
+        exit_code = task(args)
     except Exception:  # last resort: make sure unexpected errors reach the log
         log.exception("Unexpected error")
-        return 1
+        exit_code = 1
+
+    # Every outlook check posts its full output to the logs channel, whether or not it
+    # had anything to report. The tests and tools above do not.
+    if task is run and args.logs_channel:
+        try:
+            if send_run_log(args, run_log, exit_code) != 0:
+                exit_code = 1
+        except Exception:
+            log.exception("Unexpected error while posting the run log to the logs channel")
+            exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":
