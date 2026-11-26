@@ -1,4 +1,4 @@
-# Runs Outlooker.py on GitHub's servers every 15 minutes, so no computer of yours has
+# Runs Outlooker.py on GitHub's servers, so no computer of yours has
 # to stay on.
 #
 # Settings: outlooker.actions.ini in this repository (counties, hail, wind, lowered
