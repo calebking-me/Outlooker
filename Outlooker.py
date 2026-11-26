@@ -171,10 +171,10 @@ Slack webhook handling
 ----------------------
 Each webhook URL is checked before use (must be https, with no stray spaces, quotes or
 invisible characters) and, like the bot token, is never written to the log or posted
-to the logs channel; logs show only https://hooks.slack.com/****. Slack's documented error codes (for
-example channel_not_found or channel_is_archived) are translated into plain-language
-advice. Rate limiting (HTTP 429), Slack server errors (5xx) and network failures are
-retried up to 3 times; other errors are not.
+to the logs channel; logs show only https://hooks.slack.com/****. Slack's documented
+error codes (for example channel_not_found or channel_is_archived) are translated into
+plain-language advice. Rate limiting (HTTP 429), Slack server errors (5xx) and network
+failures are retried up to 3 times; other errors are not.
 
 Data sources
 ------------
