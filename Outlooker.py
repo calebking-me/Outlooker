@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Outlooker.py
-============
+Outlooker.py (version 1.0.0)
+============================
 
 Checks the NWS Storm Prediction Center (SPC) convective outlooks for one or more U.S.
 counties (Montgomery County, Tennessee by default) and posts an alert to a Slack
@@ -83,6 +83,29 @@ When it sends to the alerts channel
   increases. If a risk that was already reported reaches the ping window without
   increasing (for example a Day 3 Enhanced Risk that becomes the Day 2 outlook),
   the script sends one message to deliver the ping.
+
+What an alert looks like
+------------------------
+Alerts use Slack's Block Kit layout, top to bottom:
+* <!channel> on its own line, when a ping is due.
+* A large title: "SPC Severe Weather Outlook Alert for Montgomery County, TN:" (or
+  "Update" when risks only went down).
+* One bold summary line per outlook day, such as "Day 1: Enhanced Risk of Severe
+  Thunderstorms · 10% Tornado Risk (CIG2)". Tornado is named there by default; hail
+  and wind only with in-summary = yes in [hail] or [wind] (or when nothing else
+  would be named that day).
+* The details in a code block: valid times, every hazard with its status, issue time.
+* The CIG definitions, when an intensity level is reported.
+* Links: "View Latest SPC Outlooks" and, with briefing-url set in [alerts-channel],
+  "View Latest Weather Briefing" (its text is briefing-text).
+* The disclaimer in italics and, after a blank line, "Sent by NAME · ref ..." in
+  italics (see "Several instances").
+Each message also carries the same content as plain text, which Slack shows in
+notifications and which the duplicate check reads. If Slack ever rejects the layout,
+the message is sent again as plain text. Test messages and sample alerts use the same
+layout; the logs channel's run log stays a code block with the same footer.
+The wording, link text and defaults are in the "THINGS YOU MAY WANT TO CHANGE" block
+near the top of this file.
 
 Lowered or removed risks
 ------------------------
@@ -253,10 +276,76 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# =========================================================================== #
+# THINGS YOU MAY WANT TO CHANGE
+#
+# The script's own wording and defaults, collected in one place. Settings that differ
+# from one user to the next (counties, webhooks, thresholds, the briefing link ...)
+# belong in the settings file instead; see outlooker.example.ini. Change a value
+# here, save, and the next run uses it.
+# =========================================================================== #
+VERSION = "1.0.0"
+
+# --- Defaults, used when the matching setting in the settings file is blank ------ #
+DEFAULT_COUNTY_FIPS = "47125"  # [county]: Montgomery County, Tennessee
+LOCAL_TZ = "America/Chicago"  # time zone for local times in messages (%Z gives CST/CDT)
+ALERT_MIN_CATEGORY = "SLGT"  # [categorical] alert-level (TSTM, MRGL, SLGT, ENH, MDT, HIGH)
+PING_MIN_CATEGORY = "ENH"  # [categorical] ping-level
+PING_CATEGORY_DAYS = (1, 2)  # [categorical] ping-days
+ALERT_MIN_TORNADO = 5  # [tornado] alert-probability, percent
+PING_MIN_TORNADO = 10  # [tornado] ping-probability, percent
+HAIL_WIND_ALERT_PROBABILITY = 15  # [hail] and [wind] alert-probability, percent
+HAIL_WIND_ALERT_INTENSITY = 1  # [hail] and [wind] alert-intensity, CIG level
+# in-summary: whether a hazard is named in the bold summary line under the title.
+IN_SUMMARY_BY_DEFAULT = {"tornado": True, "hail": False, "wind": False}
+DUPLICATE_WINDOW_HOURS = 24  # [alerts-channel] duplicate-window
+
+# --- Wording of the Slack messages ---------------------------------------------- #
+# {place} is replaced by the county, e.g. "Montgomery County, TN (Home)". The title
+# is a Slack header (plain text, at most 150 characters).
+ALERT_TITLE = "SPC Severe Weather Outlook Alert for {place}:"
+UPDATE_TITLE = "SPC Severe Weather Outlook Update for {place}:"  # risks only went down
+TEST_TITLE = "Outlooker Test Message for {place}:"
+SPC_OUTLOOKS_PAGE = "https://www.spc.noaa.gov/products/outlook/"
+SPC_LINK_TEXT = "View Latest SPC Outlooks"
+BRIEFING_LINK_TEXT = "View Latest Weather Briefing"  # [alerts-channel] briefing-text
+# Shown in italics at the bottom of every alert and test message.
+DISCLAIMER = ("Disclaimer: This alert comes from a script written primarily by AI. Please "
+              "verify all information on the SPC outlooks page and do not use this as a "
+              "primary means of receiving severe weather alerts.")
+# The bold summary line, one per outlook day, e.g. "Day 1: Enhanced Risk of Severe
+# Thunderstorms · 10% Tornado Risk (CIG2)".
+SEVERE_STORMS = "Severe Thunderstorms"
+SUMMARY_NAMES = {"tornado": "Tornado", "hail": "Hail", "wind": "Wind"}  # "10% Tornado Risk"
+NO_LONGER_NAMES = {"tornado": "Tornadoes", "hail": "Hail", "wind": "Damaging Wind"}
+SUMMARY_SEPARATOR = " · "
+
+# --- Conditional Intensity Groups (CIGs) ----------------------------------------- #
+# Each names the strongest event SPC considers a reasonable expectation if that hazard
+# occurs. Edit the wording if SPC changes it.
+CIG_LEVELS = (1, 2, 3)  # tornado
+CIG_DEFINITIONS = {
+    1: "EF2 or stronger tornadoes possible",
+    2: "EF3 or stronger tornadoes possible",
+    3: "EF4 or stronger tornadoes possible (rare, high-end events)",
+}
+# Hail and wind CIG1 took over SPC's earlier "significant severe" thresholds (2-inch
+# hail, 65-knot gusts). The higher levels are worded from published summaries of the
+# 2026 change, which differ on the exact sizes and speeds: check SPC's definitions.
+HAIL_CIG_DEFINITIONS = {
+    1: "hail 2 inches or larger possible",
+    2: "hail about 3.5 inches or larger possible (rare, high-end events)",
+}
+WIND_CIG_DEFINITIONS = {
+    1: "gusts of 75 mph or stronger possible",
+    2: "intense, organized damaging winds possible, such as a derecho",
+    3: "extreme, widespread damaging winds possible (rare, high-end derechos)",
+}
+
+
 # --------------------------------------------------------------------------- #
-# Configuration
+# Configuration (the script's fixed data; see above for what to customize)
 # --------------------------------------------------------------------------- #
-DEFAULT_COUNTY_FIPS = "47125"  # Montgomery County, Tennessee
 LEGACY_STATE_FILE = "spc_county_alert_state.json"  # name used before county selection
 CONFIG_FILE = "outlooker.ini"  # settings file, read from the script's folder by default
 
@@ -264,11 +353,11 @@ CONFIG_FILE = "outlooker.ini"  # settings file, read from the script's folder by
 # Each [location NAME] section names one more county, with the settings of [county].
 LOCATION_SECTION = "location"
 HAZARD_SETTINGS = ("enabled", "alert-probability", "alert-intensity", "ping-probability",
-                   "ping-intensity")
+                   "ping-intensity", "in-summary")
 CONFIG_SETTINGS = {
     "county": ("fips", "county", "state"),
     "alerts-channel": ("webhook", "ping", "report-lowered", "check-duplicates", "bot-token",
-                       "channel-id", "duplicate-window"),
+                       "channel-id", "duplicate-window", "briefing-url", "briefing-text"),
     "logs-channel": ("enabled", "webhook"),
     "categorical": ("enabled", "alert-level", "ping-level", "ping-days"),
     "tornado": HAZARD_SETTINGS,
@@ -285,9 +374,7 @@ TIGERWEB_COUNTIES = ("https://tigerweb.geo.census.gov/arcgis/rest/services/TIGER
 COUNTY_FIELDS = "GEOID,NAME,BASENAME,STATE,COUNTY,INTPTLAT,INTPTLON"
 
 SPC_BASE = "https://www.spc.noaa.gov/products/outlook/"
-SPC_OUTLOOKS_PAGE = "https://www.spc.noaa.gov/products/outlook/"
-USER_AGENT = "spc-county-alert/1.1 (county severe weather outlook monitor)"
-LOCAL_TZ = "America/Chicago"  # %Z gives CST or CDT automatically
+USER_AGENT = f"outlooker/{VERSION} (county severe weather outlook monitor)"
 
 # State and DC FIPS codes. Alaska and Hawaii are accepted but SPC does not cover them.
 STATES = {
@@ -332,35 +419,6 @@ CATEGORY_SHORT = {
 # Probability contours SPC uses on the Day 1 and Day 2 outlooks (percent).
 TORNADO_LEVELS = (2, 5, 10, 15, 30, 45, 60)
 HAIL_WIND_LEVELS = (5, 15, 30, 45, 60)
-
-# Default alert and ping thresholds. Each is a setting in the settings file
-# ([categorical], [tornado], [hail], [wind]); these apply when a setting is blank.
-ALERT_MIN_CATEGORY = "SLGT"
-ALERT_MIN_TORNADO = 5
-PING_MIN_CATEGORY = "ENH"
-PING_CATEGORY_DAYS = (1, 2)
-PING_MIN_TORNADO = 10  # on any outlook that has a tornado product (Days 1 and 2)
-
-# Conditional Intensity Groups (CIGs). Each names the strongest event SPC considers a
-# reasonable expectation if that hazard occurs. Edit the wording here if SPC changes it.
-CIG_LEVELS = (1, 2, 3)  # tornado
-CIG_DEFINITIONS = {
-    1: "EF2 or stronger tornadoes possible",
-    2: "EF3 or stronger tornadoes possible",
-    3: "EF4 or stronger tornadoes possible (rare, high-end events)",
-}
-# Hail and wind CIG1 took over SPC's earlier "significant severe" thresholds (2-inch
-# hail, 65-knot gusts). The higher levels are worded from published summaries of the
-# 2026 change, which differ on the exact sizes and speeds: check SPC's definitions.
-HAIL_CIG_DEFINITIONS = {
-    1: "hail 2 inches or larger possible",
-    2: "hail about 3.5 inches or larger possible (rare, high-end events)",
-}
-WIND_CIG_DEFINITIONS = {
-    1: "gusts of 75 mph or stronger possible",
-    2: "intense, organized damaging winds possible, such as a derecho",
-    3: "extreme, widespread damaging winds possible (rare, high-end derechos)",
-}
 
 CATEGORICAL = "categorical"
 TORNADO = "tornado"
@@ -418,6 +476,7 @@ class HazardRules:
     alert_intensity: int | None
     ping_probability: int | None
     ping_intensity: int | None
+    in_summary: bool = False  # named in the alert's bold summary line
 
 
 @dataclass(frozen=True)
@@ -429,9 +488,13 @@ class CategoricalRules:
 
 
 CATEGORICAL_DEFAULTS = CategoricalRules(ALERT_MIN_CATEGORY, PING_MIN_CATEGORY, PING_CATEGORY_DAYS)
-TORNADO_RULES = HazardRules(ALERT_MIN_TORNADO, None, PING_MIN_TORNADO, None)
-HAIL_WIND_DEFAULTS = HazardRules(15, 1, None, None)  # when [hail] or [wind] is turned on
-HAZARD_DEFAULTS = {TORNADO: TORNADO_RULES, HAIL: HAIL_WIND_DEFAULTS, WIND: HAIL_WIND_DEFAULTS}
+TORNADO_RULES = HazardRules(ALERT_MIN_TORNADO, None, PING_MIN_TORNADO, None,
+                            IN_SUMMARY_BY_DEFAULT["tornado"])
+HAIL_DEFAULTS = HazardRules(HAIL_WIND_ALERT_PROBABILITY, HAIL_WIND_ALERT_INTENSITY, None, None,
+                            IN_SUMMARY_BY_DEFAULT["hail"])
+WIND_DEFAULTS = HazardRules(HAIL_WIND_ALERT_PROBABILITY, HAIL_WIND_ALERT_INTENSITY, None, None,
+                            IN_SUMMARY_BY_DEFAULT["wind"])
+HAZARD_DEFAULTS = {TORNADO: TORNADO_RULES, HAIL: HAIL_DEFAULTS, WIND: WIND_DEFAULTS}
 ON_BY_DEFAULT = {CATEGORICAL: True, TORNADO: True, HAIL: False, WIND: False}
 # The rules with every setting blank: hail and wind are checked only when turned on.
 DEFAULT_RULES = {CATEGORICAL: CATEGORICAL_DEFAULTS, TORNADO: TORNADO_RULES}
@@ -461,8 +524,7 @@ HEARTBEAT_TIMEOUT = 10  # seconds per try
 # channel takes the Slack Web API and a bot token; webhooks can only post.
 SLACK_API = "https://slack.com/api/"
 HISTORY_LIMIT = 50  # newest messages read from the alerts channel
-DUPLICATE_WINDOW_HOURS = 24  # default for duplicate-window
-REF_RE = re.compile(r"\bref ([0-9a-f]{12})\b")
+REF_RE = re.compile(r"\bref ([0-9a-f]{12})(?![0-9A-Za-z])")
 # Plain-language explanations of conversations.history error codes.
 HISTORY_ERROR_HELP = {
     "not_in_channel": "the Slack app is not a member of the alerts channel. Invite it there "
@@ -499,13 +561,9 @@ SLACK_ERROR_HELP = {
     "no_team": "the Slack workspace for this webhook was not found. " + _NEW_WEBHOOK,
     "team_disabled": "the Slack workspace for this webhook is disabled.",
     "rollup_error": "Slack had an internal error. It should work on a later try.",
+    "invalid_blocks": "Slack could not show the message layout.",
+    "invalid_blocks_format": "Slack could not show the message layout.",
 }
-
-DISCLAIMER = (
-    "_Disclaimer: This alert comes from a script written by Claude Opus 5.5. "
-    "Verify all information on the SPC outlooks page. Do not use this as a primary "
-    "means of receiving severe weather alerts._"
-)
 
 log = logging.getLogger("spc_county_alert")
 
@@ -519,6 +577,7 @@ class Product:
 
     @property
     def label(self) -> str:
+        """A short description for logs and messages."""
         return f"Day {self.day} {KIND_LABELS[self.kind]}"
 
 
@@ -547,7 +606,15 @@ class DataError(Exception):
 
 
 class SlackError(RuntimeError):
-    """Raised when a message could not be delivered to Slack. Never contains the URL."""
+    """Raised when a message could not be delivered to Slack. Never contains the URL.
+
+    code is Slack's error code (such as "invalid_blocks") when Slack sent one.
+    """
+
+    def __init__(self, message: str, code: str | None = None) -> None:
+        """Store the message and Slack's error code."""
+        super().__init__(message)
+        self.code = code
 
 
 class RequestError(RuntimeError):
@@ -577,12 +644,14 @@ def iter_polygons(geometry: dict | None) -> list[list]:
 
 
 def _bbox(points) -> tuple[float, float, float, float]:
+    """Bounding box (min x, min y, max x, max y) of a list of points."""
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
     return min(xs), min(ys), max(xs), max(ys)
 
 
 def _bbox_overlap(a, b) -> bool:
+    """True if two bounding boxes overlap or touch."""
     return a[0] <= b[2] and b[0] <= a[2] and a[1] <= b[3] and b[1] <= a[3]
 
 
@@ -595,6 +664,7 @@ def _edges(ring):
 
 
 def _orient(a, b, c) -> float:
+    """Which side of line a-b point c is on: positive, negative, or 0 if on the line."""
     return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
 
 
@@ -815,6 +885,7 @@ class Hazard:
 
     @property
     def rank(self) -> int:
+        """A number for comparing this hazard's level with another of the same kind."""
         return rank_of(self.kind, self.level)
 
     def _limit(self, rules: dict, alert: bool) -> int | None:
@@ -836,6 +907,7 @@ class Hazard:
         return limit is not None and self.level >= limit
 
     def is_ping_eligible(self, rules: dict) -> bool:
+        """Reaches its ping threshold under `rules` (see is_alertable)."""
         if self.kind == CATEGORICAL:
             r = rules.get(CATEGORICAL)
             return (r is not None and r.ping_level is not None and self.day in r.ping_days
@@ -850,9 +922,11 @@ class Hazard:
 
     @property
     def ping_eligible(self) -> bool:
+        """Under the default rules (every setting blank)."""
         return self.is_ping_eligible(DEFAULT_RULES)
 
     def describe(self) -> str:
+        """One line for the message details, e.g. "Tornado: *10%* probability ..."."""
         name = HAZARD_NAMES[self.kind]
         if self.kind == CATEGORICAL:
             return f"{name}: *{CATEGORY_NAMES[self.level]}*"
@@ -861,13 +935,16 @@ class Hazard:
         return f"{name}: *{self.level}%* probability within 25 miles of a point"
 
     def describe_removed(self) -> str:
+        """The details line for a hazard that has left the outlook."""
         return f"{HAZARD_NAMES[self.kind]}: no longer in the outlook for the county"
 
     def short(self) -> str:
+        """A few words for the log, e.g. "Day 1 tornado 10%"."""
         return f"Day {self.day} {KIND_LABELS[self.kind]} {short_level(self.kind, self.level)}"
 
 
 def short_level(kind: str, level) -> str:
+    """A level as a few words for logs and messages: "Slight", "10%" or "CIG2"."""
     if kind == CATEGORICAL:
         return CATEGORY_SHORT.get(level, str(level))
     if kind in INTENSITY_DEFINITIONS:
@@ -879,6 +956,7 @@ def short_level(kind: str, level) -> str:
 # Input / output helpers
 # --------------------------------------------------------------------------- #
 def is_url(source: str) -> bool:
+    """True for an http(s) address, False for a local path."""
     return source.startswith(("http://", "https://"))
 
 
@@ -920,6 +998,7 @@ class CountySpec:
 
     @property
     def label(self) -> str:
+        """A short description for logs and messages."""
         base = f"FIPS {self.geoid}" if self.geoid else f"{self.name}, {self.state}"
         return f"{base} ({self.nickname})" if self.nickname else base
 
@@ -935,6 +1014,7 @@ class County:
 
     @property
     def label(self) -> str:
+        """A short description for logs and messages."""
         base = f"{self.name}, {self.state}"
         return f"{base} ({self.nickname})" if self.nickname else base
 
@@ -958,6 +1038,7 @@ def _norm_name(text) -> str:
 
 
 def _strip_suffix(name: str) -> str:
+    """A county name without its " COUNTY" or " PARISH" ending."""
     for suffix in (" COUNTY", " PARISH"):
         if name.endswith(suffix):
             return name[: -len(suffix)]
@@ -1083,6 +1164,7 @@ def validate_county(data: dict, geoid: str) -> County:
 
 
 def county_cache_path(cache_dir: Path, geoid: str) -> Path:
+    """Where a county's downloaded outline is cached."""
     return Path(cache_dir) / f"county_{geoid}.geojson"
 
 
@@ -1201,6 +1283,7 @@ def explain_slack_error(status: int | None, body: str) -> str:
 
 
 def _retry_wait(attempt: int, retry_after: str | None) -> float:
+    """Seconds to wait before retry number `attempt`: Retry-After if given, else 2, 4, 8 ..."""
     if retry_after:
         try:
             return max(0.0, min(float(retry_after), SLACK_MAX_RETRY_WAIT))
@@ -1209,15 +1292,18 @@ def _retry_wait(attempt: int, retry_after: str | None) -> float:
     return float(2 ** attempt)
 
 
-def post_to_slack(webhook_url: str, text: str, *, timeout: float = SLACK_TIMEOUT,
-                  attempts: int = SLACK_ATTEMPTS) -> None:
+def post_to_slack(webhook_url: str, text: str, *, blocks: list | None = None,
+                  timeout: float = SLACK_TIMEOUT, attempts: int = SLACK_ATTEMPTS) -> None:
     """Send a message through a Slack Incoming Webhook.
 
-    Success is HTTP 200 with the body 'ok'. Rate limiting (429), Slack server errors
-    (5xx) and network errors are retried; anything else fails at once. Raises
-    SlackError with a readable explanation. The URL never appears in the error.
+    text is the plain message (with blocks, the fallback that notifications show);
+    blocks is an optional Block Kit layout. Success is HTTP 200 with the body 'ok'.
+    Rate limiting (429), Slack server errors (5xx) and network errors are retried;
+    anything else fails at once. Raises SlackError with a readable explanation and
+    Slack's error code. The URL never appears in the error.
     """
-    body = json.dumps({"text": text}).encode("utf-8")
+    payload = {"text": text, "blocks": blocks} if blocks else {"text": text}
+    body = json.dumps(payload).encode("utf-8")
     for attempt in range(1, attempts + 1):
         request = urllib.request.Request(
             webhook_url, data=body, method="POST",
@@ -1229,19 +1315,21 @@ def post_to_slack(webhook_url: str, text: str, *, timeout: float = SLACK_TIMEOUT
                 reply = response.read().decode("utf-8", "replace")
                 if response.status == 200 and reply.strip() == "ok":
                     return
-                raise SlackError(explain_slack_error(response.status, reply))
+                raise SlackError(explain_slack_error(response.status, reply), reply.strip())
         except urllib.error.HTTPError as exc:
             reply = exc.read().decode("utf-8", "replace") if exc.fp else ""
             problem = explain_slack_error(exc.code, reply)
+            code = reply.strip()
             retryable = exc.code == 429 or exc.code >= 500
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
             problem = f"could not reach Slack: {reason}"
+            code = None
             retryable = True
 
         if not retryable or attempt == attempts:
-            raise SlackError(problem)
+            raise SlackError(problem, code)
         wait = _retry_wait(attempt, retry_after)
         log.warning("Slack attempt %d of %d failed (%s); retrying in %.0fs",
                     attempt, attempts, problem, wait)
@@ -1249,30 +1337,55 @@ def post_to_slack(webhook_url: str, text: str, *, timeout: float = SLACK_TIMEOUT
     raise SlackError("unreachable")
 
 
+@dataclass(frozen=True)
+class SlackMessage:
+    """A message for Slack: a Block Kit layout (blocks) plus the plain fallback text.
+
+    Slack shows the blocks in the channel. The text is what notifications, screen
+    readers and older clients show, and what the duplicate check reads back from the
+    channel, so it carries the same content. With no blocks, text is the message.
+    """
+    text: str
+    blocks: list = field(default_factory=list)
+
+
 def footer_line(args: argparse.Namespace, ref: str | None = None) -> str | None:
-    """The last line of every Slack message: the instance identifier, if one is set,
-    and an alert's ref when duplicate checking is on."""
+    """The italic last line of every Slack message: the instance identifier, if one is
+    set, and an alert's ref when duplicate checking is on. None when there is neither."""
     parts = []
     if getattr(args, "instance_id", None):
-        parts.append(f"Sent by {slack_escape(args.instance_id)}")
+        # An underscore in the name would end the italics early, so a look-alike
+        # character (a modifier letter low macron) stands in for it.
+        parts.append(f"Sent by {slack_escape(args.instance_id).replace('_', chr(0x2CD))}")
     if ref:
         parts.append(f"ref {ref}")
-    return " · ".join(parts) or None
+    return f"_{' · '.join(parts)}_" if parts else None
 
 
-def with_footer(args: argparse.Namespace, text: str, ref: str | None = None) -> str:
+def with_footer(args: argparse.Namespace, message, ref: str | None = None):
+    """The message (text or SlackMessage) with the footer line after a blank line."""
     line = footer_line(args, ref)
-    return f"{text}\n{line}" if line else text
+    if not line:
+        return message
+    if isinstance(message, SlackMessage):
+        blocks = message.blocks + [_context(line)] if message.blocks else []
+        return SlackMessage(f"{message.text}\n\n{line}", blocks)
+    return f"{message}\n\n{line}"
 
 
-def deliver(args: argparse.Namespace, text: str, what: str,
+def deliver(args: argparse.Namespace, message, what: str,
             channel: str = ALERTS_CHANNEL, ref: str | None = None) -> int:
-    """Print (dry run) or send a message to the alerts or logs channel, with the
-    footer line added. Returns an exit code.
+    """Print (dry run) or send a message (text or SlackMessage) to the alerts or logs
+    channel, with the footer line added. Returns an exit code.
+
+    If Slack rejects the Block Kit layout, the message is sent again as plain text,
+    so a layout problem can never stop an alert.
     """
-    text = with_footer(args, text, ref)
+    message = with_footer(args, message, ref)
+    if not isinstance(message, SlackMessage):
+        message = SlackMessage(message)
     if args.dry_run:
-        print(text)
+        print(message.text)
         log.info("Dry run: the %s for the %s was printed, not sent", what, channel)
         return 0
     webhook = args.logs_webhook if channel == LOGS_CHANNEL else args.alerts_webhook
@@ -1282,7 +1395,14 @@ def deliver(args: argparse.Namespace, text: str, what: str,
         return 1
     log.info("Sending the %s to the %s (%s)", what, channel, mask_webhook(webhook))
     try:
-        post_to_slack(webhook, text)
+        try:
+            post_to_slack(webhook, message.text, blocks=message.blocks)
+        except SlackError as exc:
+            if not (message.blocks and exc.code in ("invalid_blocks", "invalid_blocks_format")):
+                raise
+            log.warning("Slack rejected the message layout (%s); sending it as plain text",
+                        exc.code)
+            post_to_slack(webhook, message.text)
     except SlackError as exc:
         log.error("Sending the %s to the %s failed: %s", what, channel, exc)
         return 1
@@ -1440,11 +1560,13 @@ class DuplicateCheck:
     """Reads the alerts channel at most once per run, when the first alert is due."""
 
     def __init__(self, args: argparse.Namespace, now: datetime) -> None:
+        """Nothing is read until the first alert needs it."""
         self.args, self.now = args, now
         self.refs: dict[str, datetime] | None = None
         self.read = False
 
     def recent_refs(self) -> dict[str, datetime] | None:
+        """The refs in the alerts channel (see read_recent_refs), read once per run."""
         if not self.read:
             self.read = True
             self.refs = read_recent_refs(self.args, self.now)
@@ -1523,6 +1645,7 @@ def fmt_local(dt: datetime, tz: ZoneInfo) -> str:
 
 
 def status_text(status: str, previous) -> str:
+    """The bracketed note after a hazard in the details, such as "UPGRADED from Slight"."""
     if status == "new":
         return "NEW"
     if status == "upgraded":
@@ -1563,58 +1686,175 @@ def cig_definition_lines(entries) -> list[str]:
     return lines
 
 
+# Slack's limits for the blocks used below.
+HEADER_MAX = 150  # characters in a header block
+SECTION_MAX = 3000  # characters in a section or context block's text
+
+
+def _fit(text: str, limit: int) -> str:
+    """Cut text to Slack's limit for a block, marking the cut with an ellipsis."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _header(text: str) -> dict:
+    """A Block Kit header: one line of large, plain (unformatted) text."""
+    return {"type": "header", "text": {"type": "plain_text", "text": _fit(text, HEADER_MAX),
+                                       "emoji": True}}
+
+
+def _section(mrkdwn: str) -> dict:
+    """A Block Kit section of Slack-formatted text (*bold*, _italic_, <url|links>)."""
+    return {"type": "section", "text": {"type": "mrkdwn", "text": _fit(mrkdwn, SECTION_MAX)}}
+
+
+def _code_section(body: str) -> dict:
+    """A section holding body as a code block, cut so the closing ``` always fits."""
+    return _section("```" + _fit(body, SECTION_MAX - 6) + "```")
+
+
+def _context(mrkdwn: str) -> dict:
+    """A Block Kit context block: small grey text, used for the disclaimer and footer."""
+    return {"type": "context",
+            "elements": [{"type": "mrkdwn", "text": _fit(mrkdwn, SECTION_MAX)}]}
+
+
+def links_line(briefing: tuple | None = None) -> str:
+    """The links under a message: the SPC outlooks page and, when [alerts-channel]
+    briefing-url is set, the weather briefing (briefing is (url, link text))."""
+    links = [f"<{SPC_OUTLOOKS_PAGE}|{SPC_LINK_TEXT}>"]
+    if briefing and briefing[0]:
+        links.append(f"<{briefing[0]}|{slack_escape(briefing[1] or BRIEFING_LINK_TEXT)}>")
+    return SUMMARY_SEPARATOR.join(links)
+
+
+def _phrase(kind: str, entry, intensity_entry) -> str | None:
+    """One hazard's part of the summary line, e.g. "Enhanced Risk of Severe
+    Thunderstorms", "10% Tornado Risk (CIG2)" or "No Longer at Risk of Hail".
+
+    entry and intensity_entry are (hazard, status, previous) or None.
+    """
+    gone = ("removed",)
+    if kind == CATEGORICAL:
+        hazard, status, _prev = entry
+        if status in gone:
+            return f"No Longer at Risk of {SEVERE_STORMS}"
+        name = (CATEGORY_NAMES["TSTM"] if hazard.level == "TSTM"
+                else f"{CATEGORY_SHORT[hazard.level]} Risk of {SEVERE_STORMS}")
+        return f"Lowered to {name}" if status in ("lowered", "below") else name
+    if entry and entry[1] in gone and (not intensity_entry or intensity_entry[1] in gone):
+        return f"No Longer at Risk of {NO_LONGER_NAMES[kind]}"
+    present = entry if entry and entry[1] not in gone else None
+    cig = intensity_entry if intensity_entry and intensity_entry[1] not in gone else None
+    if not present and not cig:
+        return None
+    phrase = f"{present[0].level}% " if present else ""
+    phrase += f"{SUMMARY_NAMES[kind]} Risk"
+    if cig:
+        phrase += f" (CIG{cig[0].level})"
+    if present and present[1] in ("lowered", "below"):
+        phrase = f"Lowered to {phrase}"
+    return phrase
+
+
+def day_summary(day: int, day_entries: list, rules: dict) -> str:
+    """The bold summary line for one outlook day: the categorical risk, then each
+    tornado, hail or wind risk whose in-summary setting is on. When that leaves the
+    line empty (say a day reported only for wind), every hazard of the day is named,
+    so the line always says what the alert is about."""
+    by_kind = {hazard.kind: (hazard, status, prev) for hazard, status, prev in day_entries}
+
+    def phrases(respect_settings: bool) -> list[str]:
+        """The summary phrases, optionally leaving out hazards with in-summary off."""
+        parts = []
+        if CATEGORICAL in by_kind:
+            parts.append(_phrase(CATEGORICAL, by_kind[CATEGORICAL], None))
+        for kind in (TORNADO, HAIL, WIND):
+            kind_rules = rules.get(kind)
+            if respect_settings and (kind_rules is None or not kind_rules.in_summary):
+                continue
+            phrase = _phrase(kind, by_kind.get(kind), by_kind.get(INTENSITY_OF[kind]))
+            if phrase:
+                parts.append(phrase)
+        return parts
+
+    parts = phrases(True) or phrases(False)
+    return f"Day {day}: " + (SUMMARY_SEPARATOR.join(parts) or "See the details below")
+
+
+def _detail_lines(day: int, day_entries: list, tz: ZoneInfo | None) -> list[str]:
+    """One day's lines for the code block: valid times, each hazard with its status,
+    and the issue time. Plain text, since a code block shows formatting marks as-is."""
+    ref = day_entries[0][0]
+    header = f"Day {day} outlook"
+    if ref.valid:
+        header += f" - valid {fmt_utc(ref.valid)} to {fmt_utc(ref.expire)}"
+        if tz:
+            header += f" ({fmt_local(ref.valid, tz)} to {fmt_local(ref.expire, tz)})"
+    lines = [header]
+    for hazard, status, previous in day_entries:
+        text = hazard.describe_removed() if status == "removed" else hazard.describe()
+        lines.append(f"- {text.replace('*', '')} [{status_text(status, previous)}]")
+    if ref.issue:
+        issued = f"Issued {fmt_utc(ref.issue)}"
+        if tz:
+            issued += f" ({fmt_local(ref.issue, tz)})"
+        lines.append(issued)
+    return lines
+
+
 def build_message(county_label: str, entries: list[tuple[Hazard, str, str | None]],
-                  ping: bool, tz: ZoneInfo | None, failed: list[str]) -> str:
-    """Build the Slack text.
+                  ping: bool, tz: ZoneInfo | None, failed: list[str],
+                  rules: dict | None = None, briefing: tuple | None = None) -> SlackMessage:
+    """Build an alert for one county.
 
     entries: (hazard, status, previous level text) for every hazard in the message.
     status is "new", "upgraded", "unchanged" or "lower", and with report-lowered also
     "lowered", "below" (now below the alert threshold) or "removed" (gone from the
     outlook; the hazard then carries the level it had). A message that reports no new
-    or higher risk, and does not ping, is headed as an update rather than an alert.
+    or higher risk, and does not ping, is titled as an update rather than an alert.
+    rules decides which hazards appear in the summary line (in-summary); briefing is
+    (url, link text) for the optional weather briefing link.
+
+    Layout, top to bottom: the @channel ping (when due), the title as a header, one
+    bold summary line per day, the details in a code block, the CIG definitions, the
+    links and the disclaimer. The footer (instance and ref) is added when sending.
     """
+    rules = DEFAULT_RULES if rules is None else rules
     rising = ping or any(status in ("new", "upgraded") for _hazard, status, _prev in entries)
-    headline = (f"*SPC severe weather outlook {'alert' if rising else 'update'} "
-                f"for {county_label}*")
-    lines = [f"{CHANNEL_PING} {headline}" if ping else headline,
-             f"{'Highest' if rising else 'Latest'} risk touching any part of the county:"]
+    title = (ALERT_TITLE if rising else UPDATE_TITLE).format(place=county_label)
 
     by_day: dict[int, list] = {}
     for entry in entries:
         by_day.setdefault(entry[0].day, []).append(entry)
-
+    summary, details = [], []
     for day in sorted(by_day):
         day_entries = sorted(by_day[day], key=lambda e: KIND_ORDER[e[0].kind])
-        ref = day_entries[0][0]
-        lines.append("")
-        header = f"*Day {day} outlook*"
-        if ref.valid:
-            header += f" - valid {fmt_utc(ref.valid)} to {fmt_utc(ref.expire)}"
-            if tz:
-                header += f" ({fmt_local(ref.valid, tz)} to {fmt_local(ref.expire, tz)})"
-        lines.append(header)
-        for hazard, status, previous in day_entries:
-            text = hazard.describe_removed() if status == "removed" else hazard.describe()
-            lines.append(f"- {text} [{status_text(status, previous)}]")
-        if ref.issue:
-            issued = f"Issued {fmt_utc(ref.issue)}"
-            if tz:
-                issued += f" ({fmt_local(ref.issue, tz)})"
-            lines.append(issued)
+        summary.append(f"*{slack_escape(day_summary(day, day_entries, rules))}*")
+        if details:
+            details.append("")
+        details += _detail_lines(day, day_entries, tz)
+    detail_text = slack_escape("\n".join(details))
+    definitions = "\n".join(cig_definition_lines(entries)).strip()
+    failed_note = (f"_Could not load: {', '.join(failed)}. Check SPC directly for these "
+                   "outlooks._") if failed else ""
+    links = links_line(briefing)
+    disclaimer = f"_{DISCLAIMER}_"
 
-    lines.extend(cig_definition_lines(entries))
+    blocks = [_section(CHANNEL_PING)] if ping else []
+    blocks += [_header(title), _section("\n".join(summary)), _code_section(detail_text)]
+    blocks += [_section(part) for part in (definitions, failed_note) if part]
+    blocks += [_section(links), _context(disclaimer)]
 
-    if failed:
-        lines.append("")
-        lines.append(f"_Could not load: {', '.join(failed)}. Check SPC directly for these outlooks._")
-    lines.append("")
-    lines.append(f"SPC outlooks: <{SPC_OUTLOOKS_PAGE}|{SPC_OUTLOOKS_PAGE}>")
-    lines.append(DISCLAIMER)
-    return "\n".join(lines)
+    lines = [CHANNEL_PING] if ping else []
+    lines += [f"*{slack_escape(title)}*", *summary, f"```{detail_text}```"]
+    lines += [part for part in (definitions, failed_note) if part]
+    lines += ["", links, disclaimer]
+    return SlackMessage("\n".join(lines), blocks)
 
 
 def build_test_webhook_message(county_label: str, now: datetime, tz: ZoneInfo | None,
-                               channel: str = ALERTS_CHANNEL) -> str:
+                               channel: str = ALERTS_CHANNEL,
+                               briefing: tuple | None = None) -> SlackMessage:
     """A short message that confirms a channel's webhook works. Never pings."""
     sent = fmt_utc(now)
     if tz:
@@ -1623,15 +1863,13 @@ def build_test_webhook_message(county_label: str, now: datetime, tz: ZoneInfo | 
         purpose = "The full output of every outlook check will be posted here."
     else:
         purpose = "Alerts will be posted here when a risk reaches the alert threshold."
-    return "\n".join([
-        f"*Test message from the SPC outlook alert script for {county_label}*",
-        f"If you can read this, the {channel} webhook is working. {purpose} "
-        "This is not a weather alert; no outlook data was checked.",
-        f"Sent {sent}",
-        "",
-        f"SPC outlooks: <{SPC_OUTLOOKS_PAGE}|{SPC_OUTLOOKS_PAGE}>",
-        DISCLAIMER,
-    ])
+    title = TEST_TITLE.format(place=county_label)
+    body = (f"If you can read this, the {channel} webhook is working. {purpose} "
+            f"This is not a weather alert; no outlook data was checked.\nSent {sent}")
+    links, disclaimer = links_line(briefing), f"_{DISCLAIMER}_"
+    blocks = [_header(title), _section(body), _section(links), _context(disclaimer)]
+    text = "\n".join([f"*{slack_escape(title)}*", body, "", links, disclaimer])
+    return SlackMessage(text, blocks)
 
 
 def sample_entries(now: datetime) -> list[tuple[Hazard, str, str | None]]:
@@ -1651,11 +1889,17 @@ def sample_entries(now: datetime) -> list[tuple[Hazard, str, str | None]]:
     ]
 
 
-def build_test_alert(county_label: str, now: datetime, tz: ZoneInfo | None, ping: bool) -> str:
+def build_test_alert(county_label: str, now: datetime, tz: ZoneInfo | None, ping: bool,
+                     rules: dict | None = None, briefing: tuple | None = None) -> SlackMessage:
     """A sample alert in the real format, clearly marked as a test with made-up data."""
     banner = ("*TEST MESSAGE - sample data, not a real forecast.* "
               "This shows what an alert looks like. Check SPC for the actual outlook.")
-    return banner + "\n\n" + build_message(county_label, sample_entries(now), ping, tz, [])
+    alert = build_message(county_label, sample_entries(now), ping, tz, [], rules, briefing)
+    blocks = list(alert.blocks)
+    blocks.insert(1 if ping else 0, _section(banner))  # after the ping, before the title
+    lines = alert.text.split("\n")
+    lines.insert(1 if ping else 0, banner)
+    return SlackMessage("\n".join(lines), blocks)
 
 
 def slack_escape(text: str) -> str:
@@ -1728,6 +1972,7 @@ def _hide_urls(text: str, secrets) -> str:
 # Main logic
 # --------------------------------------------------------------------------- #
 def get_local_tz() -> ZoneInfo | None:
+    """The time zone for local times in messages, or None if its data is missing."""
     try:
         return ZoneInfo(LOCAL_TZ)
     except ZoneInfoNotFoundError:
@@ -1981,12 +2226,14 @@ def check_county(args: argparse.Namespace, county: County, outlooks: list[Outloo
                  "changed" if args.report_lowered else "increased")
         return exit_code
 
-    message = build_message(county.label, entries, ping, tz, failed)
+    message = build_message(county.label, entries, ping, tz, failed, args.rules,
+                            briefing_of(args))
     ref = alert_ref(county, entries, ping) if duplicates else None
-    log.info("Alert created (ping=%s%s):\n%s", ping, f", ref {ref}" if ref else "", message)
+    log.info("Alert created (ping=%s%s):\n%s", ping, f", ref {ref}" if ref else "",
+             message.text)
 
     if args.dry_run:
-        print(with_footer(args, message, ref))
+        print(with_footer(args, message, ref).text)
         log.info("Dry run: message not sent and state not saved")
         return exit_code
 
@@ -2014,6 +2261,7 @@ def check_county(args: argparse.Namespace, county: County, outlooks: list[Outloo
     # Remember, for each outlook period, the highest level reported (and pinged) and
     # the level this message reported.
     def higher(kind, old, new_rank) -> bool:
+        """True if new_rank is above the rank of the old level (or there is none)."""
         old_rank = rank_of(kind, old)
         return old_rank is None or new_rank > old_rank
 
@@ -2084,6 +2332,12 @@ def _county_label_best_effort(args: argparse.Namespace) -> str:
     return _join(labels)
 
 
+def briefing_of(args: argparse.Namespace) -> tuple | None:
+    """(url, link text) of the weather briefing link, or None when none is set."""
+    url = getattr(args, "briefing_url", None)
+    return (url, getattr(args, "briefing_text", None)) if url else None
+
+
 def run_test_webhook(args: argparse.Namespace, now: datetime | None = None) -> int:
     """--test-webhook: send a short message to each channel to confirm Slack delivery."""
     now = now or datetime.now(timezone.utc)
@@ -2093,7 +2347,7 @@ def run_test_webhook(args: argparse.Namespace, now: datetime | None = None) -> i
         if channel == LOGS_CHANNEL and not args.logs_channel:
             log.info("The logs channel is turned off, so it was not tested")
             continue
-        text = build_test_webhook_message(county_label, now, tz, channel)
+        text = build_test_webhook_message(county_label, now, tz, channel, briefing_of(args))
         if deliver(args, text, "test message", channel) != 0:
             exit_code = 1
     if args.check_duplicates:
@@ -2110,7 +2364,8 @@ def run_test_alert(args: argparse.Namespace, now: datetime | None = None) -> int
     """--test-alert: send a sample alert in the real format, marked as a test."""
     now = now or datetime.now(timezone.utc)
     ping = args.test_ping and not args.no_ping
-    text = build_test_alert(_county_label_best_effort(args), now, get_local_tz(), ping)
+    text = build_test_alert(_county_label_best_effort(args), now, get_local_tz(), ping,
+                            args.rules, briefing_of(args))
     return deliver(args, text, "sample alert" + (" (with channel ping)" if ping else ""),
                    ALERTS_CHANNEL)
 
@@ -2257,6 +2512,7 @@ class Config:
     locations: list = field(default_factory=list)  # see read_config
 
     def text(self, section: str, key: str) -> str | None:
+        """A setting's value, or None when it is blank or missing."""
         return self.values.get(section, {}).get(key)
 
     def flag(self, section: str, key: str) -> bool | None:
@@ -2397,6 +2653,8 @@ def hazard_rules(config: Config, section: str) -> HazardRules | None:
         config.threshold(section, "alert-intensity", defaults.alert_intensity, highest_cig, False),
         config.threshold(section, "ping-probability", defaults.ping_probability, 100, True),
         config.threshold(section, "ping-intensity", defaults.ping_intensity, highest_cig, False),
+        defaults.in_summary if config.flag(section, "in-summary") is None
+        else config.flag(section, "in-summary"),
     )
     enabled = config.flag(section, "enabled")
     if enabled is False or (enabled is None and not ON_BY_DEFAULT[section]):
@@ -2476,6 +2734,16 @@ def apply_settings(args: argparse.Namespace, config: Config) -> None:
         if not 1 <= args.duplicate_window <= 48:
             raise ConfigError(f"duplicate-window in [alerts-channel] of {config.path} must be "
                               f"a number of hours from 1 to 48, not {window!r}")
+    args.briefing_url = config.text("alerts-channel", "briefing-url")
+    args.briefing_text = config.text("alerts-channel", "briefing-text") or BRIEFING_LINK_TEXT
+    if args.briefing_url:
+        problem = check_url(args.briefing_url) or (
+            "it contains a | character" if "|" in args.briefing_url else None)
+        if problem:
+            raise ConfigError(f"briefing-url in [alerts-channel] of {config.path} is not "
+                              f"usable: {problem}")
+    if len(args.briefing_text) > 80 or not args.briefing_text.isprintable():
+        raise ConfigError("briefing-text must be one line of at most 80 characters")
     args.instance_id = _first(args.instance_id, env.get("OUTLOOKER_INSTANCE_ID"),
                               config.text("options", "instance-id"))
     if args.instance_id and (len(args.instance_id) > 80 or not args.instance_id.isprintable()):
@@ -2495,6 +2763,8 @@ def apply_settings(args: argparse.Namespace, config: Config) -> None:
 # Command line
 # --------------------------------------------------------------------------- #
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Read the command line, then fill in the rest from the environment and the
+    settings file (see apply_settings). Exits with code 2 on a mistake."""
     here = Path(__file__).resolve().parent
     p = argparse.ArgumentParser(
         description="Alert a Slack channel to SPC convective outlook risks for one or "
@@ -2601,6 +2871,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             county_from = f"[county] in {config.path}"
 
     def county_error(message: str) -> None:
+        """Stop with a county mistake, saying where the county settings came from."""
         if county_from:
             message += f". The county settings came from {county_from}"
         p.error(message)
@@ -2668,11 +2939,13 @@ class RunLog(logging.Handler):
     """Keeps a copy of this run's log lines, to post to the logs channel."""
 
     def __init__(self) -> None:
+        """Start with no lines."""
         super().__init__()
         self.lines: list[str] = []
         self.highest = logging.NOTSET  # the most severe level logged so far
 
     def emit(self, record: logging.LogRecord) -> None:
+        """Keep one formatted log line (part of logging.Handler)."""
         try:
             self.lines.append(self.format(record))
         except Exception:  # a logging problem must never stop the run
@@ -2734,6 +3007,9 @@ def _attempt(what: str, step, *step_args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the script: one outlook check, or one of the test options. After an
+    outlook check, also post the run log, the heartbeat and the failure signal.
+    Returns the exit code."""
     args = parse_args(argv)
     run_log = setup_logging(args.log_file, args.verbose)
     if args.config:
