@@ -10,6 +10,7 @@
 #   OUTLOOKER_HEARTBEAT_URL    requested after every run, for a monitoring service
 #                              such as healthchecks.io (optional)
 #   OUTLOOKER_FAILURE_URL      requested when a run has a problem (optional)
+#   SLACK_BOT_TOKEN            Slack app bot token, for check-duplicates (optional)
 #
 # Schedules only run from the default branch (main). Run it by hand from the Actions
 # tab with "Run workflow"; choose test-webhook first to check both channels.
@@ -63,6 +64,7 @@ jobs:
           SLACK_LOGS_WEBHOOK_URL: ${{ secrets.SLACK_LOGS_WEBHOOK_URL }}
           OUTLOOKER_HEARTBEAT_URL: ${{ secrets.OUTLOOKER_HEARTBEAT_URL }}
           OUTLOOKER_FAILURE_URL: ${{ secrets.OUTLOOKER_FAILURE_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           MODE: ${{ inputs.mode || 'check' }}
         run: |
           case "$MODE" in
