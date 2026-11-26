@@ -115,8 +115,11 @@ on GitHub Actions) without sending the same alert twice:
   its last line ("ref 3f9a1c2b7d40"). Instances that see the same outlook, with the
   same settings, build the same alert and the same ref.
 * Before sending, the script reads the alerts channel's messages from the last
-  duplicate-window hours (default 3). If one carries the same ref, another instance
-  already sent the alert: it is not sent again, but it is remembered as sent.
+  duplicate-window hours (default 24). If one carries the same ref and was posted
+  after this instance last updated its record of those outlook periods, another
+  instance already sent the alert: it is not sent again, but it is remembered as sent.
+  An older message with the same ref does not count, so a risk that is removed and
+  later comes back the same way is still announced.
 * Reading the channel takes a Slack app bot token (bot-token, or the environment
   variable SLACK_BOT_TOKEN) with the channels:history scope (groups:history for a
   private channel), the app invited to the channel, and the channel's ID (channel-id,
@@ -441,7 +444,7 @@ HEARTBEAT_TIMEOUT = 10  # seconds per try
 # channel takes the Slack Web API and a bot token; webhooks can only post.
 SLACK_API = "https://slack.com/api/"
 HISTORY_LIMIT = 50  # newest messages read from the alerts channel
-DUPLICATE_WINDOW_HOURS = 3  # default for duplicate-window
+DUPLICATE_WINDOW_HOURS = 24  # default for duplicate-window
 REF_RE = re.compile(r"\bref ([0-9a-f]{12})\b")
 # Plain-language explanations of conversations.history error codes.
 HISTORY_ERROR_HELP = {
@@ -1347,9 +1350,10 @@ def alert_ref(county: County, entries: list, ping: bool) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def read_channel_history(token: str, channel: str, oldest: datetime) -> list[str]:
-    """The text of the channel's messages since `oldest`, newest first (at most
-    HISTORY_LIMIT). Raises SlackError, which never contains the token."""
+def read_channel_history(token: str, channel: str, oldest: datetime
+                         ) -> list[tuple[datetime, str]]:
+    """(time posted, text) of the channel's messages since `oldest`, newest first (at
+    most HISTORY_LIMIT). Raises SlackError, which never contains the token."""
     query = urllib.parse.urlencode({"channel": channel, "limit": HISTORY_LIMIT,
                                     "oldest": f"{oldest.timestamp():.6f}"})
     try:
@@ -1365,12 +1369,21 @@ def read_channel_history(token: str, channel: str, oldest: datetime) -> list[str
         code = str(reply.get("error", "unknown_error")) if isinstance(reply, dict) else "?"
         help_text = HISTORY_ERROR_HELP.get(code)
         raise SlackError(f"Slack replied '{code}'" + (f": {help_text}" if help_text else ""))
-    return [str(m.get("text", "")) for m in reply.get("messages") or [] if isinstance(m, dict)]
+    messages = []
+    for message in reply.get("messages") or []:
+        if isinstance(message, dict):
+            try:
+                posted = datetime.fromtimestamp(float(message["ts"]), timezone.utc)
+            except (KeyError, TypeError, ValueError, OverflowError, OSError):
+                posted = datetime.now(timezone.utc)  # Slack always sends ts; be safe
+            messages.append((posted, str(message.get("text", ""))))
+    return messages
 
 
-def read_recent_refs(args: argparse.Namespace, now: datetime) -> set[str] | None:
+def read_recent_refs(args: argparse.Namespace, now: datetime) -> dict[str, datetime] | None:
     """The alert refs in the alerts channel's messages from the last duplicate-window
-    hours, or None (after logging why) if the channel could not be read."""
+    hours, each with the time of its newest message, or None (after logging why) if
+    the channel could not be read."""
     if not args.bot_token or not args.channel_id:
         problem = "check-duplicates needs bot-token and channel-id under [alerts-channel]"
     else:
@@ -1380,7 +1393,10 @@ def read_recent_refs(args: argparse.Namespace, now: datetime) -> set[str] | None
         except SlackError as exc:
             problem = str(exc)
         else:
-            refs = {m.group(1) for text in messages for m in REF_RE.finditer(text)}
+            refs: dict[str, datetime] = {}
+            for posted, text in messages:
+                for match in REF_RE.finditer(text):
+                    refs[match.group(1)] = max(posted, refs.get(match.group(1), posted))
             log.info("Read %d recent message(s) in the alerts channel (%d with an alert ref)",
                      len(messages), len(refs))
             return refs
@@ -1388,15 +1404,27 @@ def read_recent_refs(args: argparse.Namespace, now: datetime) -> set[str] | None
     return None
 
 
+def last_state_update(periods: dict, entries: list) -> datetime | None:
+    """When this instance last updated its record of the alert's outlook periods."""
+    times = []
+    for hazard, _status, _prev in entries:
+        stamp = (periods.get(hazard.period_key) or {}).get("updated")
+        try:
+            times.append(datetime.strptime(stamp, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc))
+        except (TypeError, ValueError):
+            pass
+    return max(times, default=None)
+
+
 class DuplicateCheck:
     """Reads the alerts channel at most once per run, when the first alert is due."""
 
     def __init__(self, args: argparse.Namespace, now: datetime) -> None:
         self.args, self.now = args, now
-        self.refs: set[str] | None = None
+        self.refs: dict[str, datetime] | None = None
         self.read = False
 
-    def recent_refs(self) -> set[str] | None:
+    def recent_refs(self) -> dict[str, datetime] | None:
         if not self.read:
             self.read = True
             self.refs = read_recent_refs(self.args, self.now)
@@ -1949,9 +1977,17 @@ def check_county(args: argparse.Namespace, county: County, outlooks: list[Outloo
             log.warning("Sending the alert without the duplicate check")
             exit_code = 1
         elif ref in refs:
-            already_sent = True
-            log.info("The alerts channel already has this alert (ref %s), sent by another "
-                     "instance; not sending it again", ref)
+            # Only a message posted after this instance last updated these outlook
+            # periods is another instance's copy; an older one is a past alert that
+            # happens to match (a risk that went away and came back the same way).
+            last_update = last_state_update(periods, entries)
+            if last_update is None or refs[ref] > last_update:
+                already_sent = True
+                log.info("The alerts channel already has this alert (ref %s), sent by "
+                         "another instance; not sending it again", ref)
+            else:
+                log.info("An earlier message has the same ref %s, from before this "
+                         "instance's last update; sending the alert", ref)
     if not already_sent and deliver(args, message, "alert", ALERTS_CHANNEL, ref=ref) != 0:
         return 1  # the state is not saved, so the next run will try again
 
