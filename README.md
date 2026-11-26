@@ -6,6 +6,7 @@ Several counties: Each [location NAME] section in the settings file adds a count
 Lowered risks: Optionally, the alerts channel also hears when a risk it was alerted about is lowered, drops below the alert threshold, or is removed from the outlook.
 Message contents: Times appear in both Z and Central. Each message links to the SPC outlooks page and ends with the updated disclaimer.
 Logs channel: Optional. When it is turned on, every outlook check (every normal run, not the test options) posts its full output to the logs channel, whether or not there is anything to report. Alerts still go to the alerts channel. The logs channel never pings anyone.
+Several instances: Optional. The script can run in more than one place at once: with check-duplicates turned on, it reads the alerts channel's recent messages (this needs a Slack app bot token) and skips an alert another instance already posted. An instance-id setting adds "Sent by NAME" to the end of every Slack message, so you can tell instances apart.
 Heartbeat: Optional. After every check it can request a URL for a monitoring service such as healthchecks.io, which warns you if the checks stop, plus a second URL when a check has a problem.
 Repeat alerts: A state file for each county stops it from repeating alerts.
 Dependencies: It uses only the Python standard library.

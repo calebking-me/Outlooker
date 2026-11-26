@@ -107,6 +107,29 @@ still go to the alerts channel as described above.
 * --test-webhook sends a test message to both channels. The other test options do not
   post to the logs channel, and --dry-run prints the run log instead of posting it.
 
+Several instances (duplicate check and instance identifier)
+-----------------------------------------------------------
+The script can run in more than one place at once (for example on a home computer and
+on GitHub Actions) without sending the same alert twice:
+* check-duplicates = yes in [alerts-channel] gives each alert a short ref, shown on
+  its last line ("ref 3f9a1c2b7d40"). Instances that see the same outlook, with the
+  same settings, build the same alert and the same ref.
+* Before sending, the script reads the alerts channel's messages from the last
+  duplicate-window hours (default 3). If one carries the same ref, another instance
+  already sent the alert: it is not sent again, but it is remembered as sent.
+* Reading the channel takes a Slack app bot token (bot-token, or the environment
+  variable SLACK_BOT_TOKEN) with the channels:history scope (groups:history for a
+  private channel), the app invited to the channel, and the channel's ID (channel-id,
+  such as C0123456789). The token is a secret and is masked like the webhook URLs.
+* If the channel cannot be read, the alert is sent anyway and the exit code is 1: a
+  duplicate is better than a missed alert. Two instances that run at the very same
+  moment can still both send, so give them different schedules. Turn it on in every
+  instance; --test-webhook also checks that the channel can be read.
+* instance-id in [options] (or --instance-id, or OUTLOOKER_INSTANCE_ID) is added to
+  the end of every Slack message the instance sends, alerts, run logs and tests, as
+  "Sent by NAME", so you can tell where a message came from. The logs channel, the
+  heartbeat and the state files stay per instance.
+
 Heartbeat and failure signal
 ----------------------------
 For a monitoring service such as healthchecks.io, Uptime Kuma or Cronitor ([heartbeat]
@@ -147,8 +170,8 @@ in test_spc_county_alert.py (python -m unittest -v test_spc_county_alert).
 Slack webhook handling
 ----------------------
 Each webhook URL is checked before use (must be https, with no stray spaces, quotes or
-invisible characters) and is never written to the log or posted to the logs channel;
-logs show only https://hooks.slack.com/****. Slack's documented error codes (for
+invisible characters) and, like the bot token, is never written to the log or posted
+to the logs channel; logs show only https://hooks.slack.com/****. Slack's documented error codes (for
 example channel_not_found or channel_is_archived) are translated into plain-language
 advice. Rate limiting (HTTP 429), Slack server errors (5xx) and network failures are
 retried up to 3 times; other errors are not.
@@ -186,6 +209,7 @@ Requirements and setup
 Other options
 -------------
     --config FILE       read the settings from FILE instead of outlooker.ini
+    --instance-id NAME  added to the end of every Slack message (see "Several instances")
     --heartbeat-url URL, --failure-url URL   the [heartbeat] addresses (environment
                         variables OUTLOOKER_HEARTBEAT_URL, OUTLOOKER_FAILURE_URL)
     --no-ping           never ping the channel (handy while testing in a real channel)
@@ -207,6 +231,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import difflib
+import hashlib
 import http.client
 import json
 import logging
@@ -237,12 +262,13 @@ HAZARD_SETTINGS = ("enabled", "alert-probability", "alert-intensity", "ping-prob
                    "ping-intensity")
 CONFIG_SETTINGS = {
     "county": ("fips", "county", "state"),
-    "alerts-channel": ("webhook", "ping", "report-lowered"),
+    "alerts-channel": ("webhook", "ping", "report-lowered", "check-duplicates", "bot-token",
+                       "channel-id", "duplicate-window"),
     "logs-channel": ("enabled", "webhook"),
     "hail": HAZARD_SETTINGS,
     "wind": HAZARD_SETTINGS,
     "heartbeat": ("url", "failure-url", "method"),
-    "options": ("verbose", "log-file", "state-file", "cache-dir"),
+    "options": ("verbose", "log-file", "state-file", "cache-dir", "instance-id"),
 }
 
 # Census TIGERweb Counties layer. outSR=4326 returns longitude/latitude, which is
@@ -410,6 +436,26 @@ LOGS_MAX_CHARS = 12_000
 # Heartbeat and failure signal requests to a monitoring service.
 HEARTBEAT_ATTEMPTS = 3
 HEARTBEAT_TIMEOUT = 10  # seconds per try
+
+# Checking the alerts channel for an alert another instance already sent. Reading a
+# channel takes the Slack Web API and a bot token; webhooks can only post.
+SLACK_API = "https://slack.com/api/"
+HISTORY_LIMIT = 50  # newest messages read from the alerts channel
+DUPLICATE_WINDOW_HOURS = 3  # default for duplicate-window
+REF_RE = re.compile(r"\bref ([0-9a-f]{12})\b")
+# Plain-language explanations of conversations.history error codes.
+HISTORY_ERROR_HELP = {
+    "not_in_channel": "the Slack app is not a member of the alerts channel. Invite it there "
+                      "(/invite @your-app-name).",
+    "missing_scope": "the bot token lacks the channels:history scope (groups:history for a "
+                     "private channel). Add it to the Slack app and reinstall the app.",
+    "channel_not_found": "the app cannot see a channel with that channel-id. Copy the ID "
+                         "from the channel's details in Slack (it looks like C0123456789).",
+    "invalid_auth": "the bot token is not valid. Copy it again from the Slack app.",
+    "not_authed": "no bot token was sent.",
+    "token_revoked": "the bot token was revoked. Copy a new one from the Slack app.",
+    "account_inactive": "the bot token belongs to a deleted app or user.",
+}
 
 _NEW_WEBHOOK = ("Create a new webhook in your Slack app and update the webhook URL in "
                 "your settings.")
@@ -1180,12 +1226,28 @@ def post_to_slack(webhook_url: str, text: str, *, timeout: float = SLACK_TIMEOUT
     raise SlackError("unreachable")
 
 
-def deliver(args: argparse.Namespace, text: str, what: str,
-            channel: str = ALERTS_CHANNEL) -> int:
-    """Print (dry run) or send a message to the alerts or logs channel.
+def footer_line(args: argparse.Namespace, ref: str | None = None) -> str | None:
+    """The last line of every Slack message: the instance identifier, if one is set,
+    and an alert's ref when duplicate checking is on."""
+    parts = []
+    if getattr(args, "instance_id", None):
+        parts.append(f"Sent by {slack_escape(args.instance_id)}")
+    if ref:
+        parts.append(f"ref {ref}")
+    return " · ".join(parts) or None
 
-    Returns an exit code.
+
+def with_footer(args: argparse.Namespace, text: str, ref: str | None = None) -> str:
+    line = footer_line(args, ref)
+    return f"{text}\n{line}" if line else text
+
+
+def deliver(args: argparse.Namespace, text: str, what: str,
+            channel: str = ALERTS_CHANNEL, ref: str | None = None) -> int:
+    """Print (dry run) or send a message to the alerts or logs channel, with the
+    footer line added. Returns an exit code.
     """
+    text = with_footer(args, text, ref)
     if args.dry_run:
         print(text)
         log.info("Dry run: the %s for the %s was printed, not sent", what, channel)
@@ -1221,14 +1283,16 @@ def check_url(url: str | None) -> str | None:
 
 
 def request_url(url: str, *, method: str = "GET", body: str | None = None,
-                timeout: float = HEARTBEAT_TIMEOUT, attempts: int = HEARTBEAT_ATTEMPTS) -> None:
-    """Request a URL; any 2xx reply is success. POST sends `body` as plain text.
+                headers: dict | None = None, timeout: float = HEARTBEAT_TIMEOUT,
+                attempts: int = HEARTBEAT_ATTEMPTS) -> bytes:
+    """Request a URL and return the reply; any 2xx reply is success. POST sends `body`
+    as plain text.
 
     Rate limiting (429), server errors (5xx) and network errors are retried. Raises
-    RequestError with a readable explanation that never contains the URL.
+    RequestError with a readable explanation that never contains the URL or headers.
     """
     data = body.encode("utf-8") if method == "POST" and body is not None else None
-    headers = {"User-Agent": USER_AGENT}
+    headers = {"User-Agent": USER_AGENT, **(headers or {})}
     if data is not None:
         headers["Content-Type"] = "text/plain; charset=utf-8"
     for attempt in range(1, attempts + 1):
@@ -1236,8 +1300,7 @@ def request_url(url: str, *, method: str = "GET", body: str | None = None,
         retry_after = None
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                response.read()
-            return  # urlopen raises HTTPError for any reply that is not 2xx
+                return response.read()  # urlopen raises HTTPError unless the reply is 2xx
         except urllib.error.HTTPError as exc:
             problem = f"the server replied HTTP {exc.code}"
             retryable = exc.code == 429 or exc.code >= 500
@@ -1271,6 +1334,73 @@ def notify_url(args: argparse.Namespace, url: str | None, what: str, text: str) 
         return 1
     log.info("The %s was sent", what)
     return 0
+
+
+# --------------------------------------------------------------------------- #
+# Duplicate check: alerts another instance already sent
+# --------------------------------------------------------------------------- #
+def alert_ref(county: County, entries: list, ping: bool) -> str:
+    """A short code for what an alert announces. Instances that see the same outlook
+    and keep the same settings build the same message and so the same code."""
+    lines = sorted(f"{h.period_key}|{h.kind}|{h.level}|{status}" for h, status, _p in entries)
+    raw = json.dumps([county.geoid, ping, lines])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def read_channel_history(token: str, channel: str, oldest: datetime) -> list[str]:
+    """The text of the channel's messages since `oldest`, newest first (at most
+    HISTORY_LIMIT). Raises SlackError, which never contains the token."""
+    query = urllib.parse.urlencode({"channel": channel, "limit": HISTORY_LIMIT,
+                                    "oldest": f"{oldest.timestamp():.6f}"})
+    try:
+        body = request_url(SLACK_API + "conversations.history?" + query,
+                           headers={"Authorization": f"Bearer {token}"},
+                           timeout=SLACK_TIMEOUT, attempts=SLACK_ATTEMPTS)
+        reply = json.loads(body)
+    except RequestError as exc:
+        raise SlackError(f"could not read the channel: {exc}") from exc
+    except ValueError as exc:
+        raise SlackError("Slack's reply could not be read") from exc
+    if not isinstance(reply, dict) or not reply.get("ok"):
+        code = str(reply.get("error", "unknown_error")) if isinstance(reply, dict) else "?"
+        help_text = HISTORY_ERROR_HELP.get(code)
+        raise SlackError(f"Slack replied '{code}'" + (f": {help_text}" if help_text else ""))
+    return [str(m.get("text", "")) for m in reply.get("messages") or [] if isinstance(m, dict)]
+
+
+def read_recent_refs(args: argparse.Namespace, now: datetime) -> set[str] | None:
+    """The alert refs in the alerts channel's messages from the last duplicate-window
+    hours, or None (after logging why) if the channel could not be read."""
+    if not args.bot_token or not args.channel_id:
+        problem = "check-duplicates needs bot-token and channel-id under [alerts-channel]"
+    else:
+        try:
+            messages = read_channel_history(
+                args.bot_token, args.channel_id, now - timedelta(hours=args.duplicate_window))
+        except SlackError as exc:
+            problem = str(exc)
+        else:
+            refs = {m.group(1) for text in messages for m in REF_RE.finditer(text)}
+            log.info("Read %d recent message(s) in the alerts channel (%d with an alert ref)",
+                     len(messages), len(refs))
+            return refs
+    log.error("Cannot read the alerts channel to check for duplicates: %s", problem)
+    return None
+
+
+class DuplicateCheck:
+    """Reads the alerts channel at most once per run, when the first alert is due."""
+
+    def __init__(self, args: argparse.Namespace, now: datetime) -> None:
+        self.args, self.now = args, now
+        self.refs: set[str] | None = None
+        self.read = False
+
+    def recent_refs(self) -> set[str] | None:
+        if not self.read:
+            self.read = True
+            self.refs = read_recent_refs(self.args, self.now)
+        return self.refs
 
 
 # --------------------------------------------------------------------------- #
@@ -1537,11 +1667,12 @@ def run_log_text(lines: list[str], urls: tuple = ()) -> str:
     return shorten_middle(_hide_urls("\n".join(lines) or "(no output)", urls), LOGS_MAX_CHARS)
 
 
-def _hide_urls(text: str, urls) -> str:
-    """Replace each of the given URLs in text with its masked form."""
-    for url in urls:
-        if url:
-            text = text.replace(url, mask_webhook(url))
+def _hide_urls(text: str, secrets) -> str:
+    """Replace each of the given URLs or tokens in text with its masked form."""
+    for secret in secrets:
+        if secret:
+            masked = mask_webhook(secret) if is_url(secret) else secret[:5] + "****"
+            text = text.replace(secret, masked)
     return text
 
 
@@ -1773,8 +1904,10 @@ def compare_with_state(hazards: list[Hazard], checked: dict, periods: dict, rule
 
 
 def check_county(args: argparse.Namespace, county: County, outlooks: list[Outlook],
-                 load_failed: list[str], now: datetime, tz: ZoneInfo | None) -> int:
-    """Check one county and send its alert if one is due. Returns an exit code."""
+                 load_failed: list[str], now: datetime, tz: ZoneInfo | None,
+                 duplicates: DuplicateCheck | None = None) -> int:
+    """Check one county and send its alert if one is due (unless `duplicates` finds
+    that another instance already sent it). Returns an exit code."""
     log.info("Checking SPC outlooks for %s (FIPS %s)", county.label, county.geoid)
     if county.geoid[:2] in OUTSIDE_SPC_COVERAGE:
         log.warning("SPC outlooks cover the contiguous U.S. only; %s will never be shaded",
@@ -1801,14 +1934,25 @@ def check_county(args: argparse.Namespace, county: County, outlooks: list[Outloo
         return exit_code
 
     message = build_message(county.label, entries, ping, tz, failed)
-    log.info("Alert created (ping=%s):\n%s", ping, message)
+    ref = alert_ref(county, entries, ping) if duplicates else None
+    log.info("Alert created (ping=%s%s):\n%s", ping, f", ref {ref}" if ref else "", message)
 
     if args.dry_run:
-        print(message)
+        print(with_footer(args, message, ref))
         log.info("Dry run: message not sent and state not saved")
         return exit_code
 
-    if deliver(args, message, "alert", ALERTS_CHANNEL) != 0:
+    already_sent = False
+    if duplicates:
+        refs = duplicates.recent_refs()
+        if refs is None:
+            log.warning("Sending the alert without the duplicate check")
+            exit_code = 1
+        elif ref in refs:
+            already_sent = True
+            log.info("The alerts channel already has this alert (ref %s), sent by another "
+                     "instance; not sending it again", ref)
+    if not already_sent and deliver(args, message, "alert", ALERTS_CHANNEL, ref=ref) != 0:
         return 1  # the state is not saved, so the next run will try again
 
     # Remember, for each outlook period, the highest level reported (and pinged) and
@@ -1860,8 +2004,9 @@ def run(args: argparse.Namespace, now: datetime | None = None) -> int:
         return 1
 
     outlooks, failed = load_outlooks(args, args.rules, now)
+    duplicates = DuplicateCheck(args, now) if args.check_duplicates else None
     for county in counties:
-        if check_county(args, county, outlooks, failed, now, tz) != 0:
+        if check_county(args, county, outlooks, failed, now, tz, duplicates) != 0:
             exit_code = 1
     return exit_code
 
@@ -1895,6 +2040,13 @@ def run_test_webhook(args: argparse.Namespace, now: datetime | None = None) -> i
         text = build_test_webhook_message(county_label, now, tz, channel)
         if deliver(args, text, "test message", channel) != 0:
             exit_code = 1
+    if args.check_duplicates:
+        if args.dry_run:
+            log.info("Dry run: the alerts channel was not read")
+        elif read_recent_refs(args, now) is None:
+            exit_code = 1
+        else:
+            log.info("Duplicate checking can read the alerts channel")
     return exit_code
 
 
@@ -2194,6 +2346,30 @@ def apply_settings(args: argparse.Namespace, config: Config) -> None:
         if rules:
             args.rules[section] = rules
 
+    args.check_duplicates = bool(config.flag("alerts-channel", "check-duplicates"))
+    args.bot_token = _first(env.get("SLACK_BOT_TOKEN"), config.text("alerts-channel", "bot-token"))
+    args.channel_id = _first(env.get("SLACK_ALERTS_CHANNEL_ID"),
+                             config.text("alerts-channel", "channel-id"))
+    if args.channel_id:
+        args.channel_id = args.channel_id.upper()
+        if not re.fullmatch(r"[CG][A-Z0-9]{8,14}", args.channel_id):
+            raise ConfigError(f"channel-id in [alerts-channel] of {config.path} should look "
+                              f"like C0123456789, not {args.channel_id!r}")
+    window = config.text("alerts-channel", "duplicate-window")
+    args.duplicate_window = DUPLICATE_WINDOW_HOURS
+    if window is not None:
+        try:
+            args.duplicate_window = int(window.lower().removesuffix("hours").strip())
+        except ValueError:
+            args.duplicate_window = 0
+        if not 1 <= args.duplicate_window <= 48:
+            raise ConfigError(f"duplicate-window in [alerts-channel] of {config.path} must be "
+                              f"a number of hours from 1 to 48, not {window!r}")
+    args.instance_id = _first(args.instance_id, env.get("OUTLOOKER_INSTANCE_ID"),
+                              config.text("options", "instance-id"))
+    if args.instance_id and (len(args.instance_id) > 80 or not args.instance_id.isprintable()):
+        raise ConfigError("instance-id must be one line of at most 80 characters")
+
     args.heartbeat_url = _first(args.heartbeat_url, env.get("OUTLOOKER_HEARTBEAT_URL"),
                                 config.text("heartbeat", "url"))
     args.failure_url = _first(args.failure_url, env.get("OUTLOOKER_FAILURE_URL"),
@@ -2242,6 +2418,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                             "webhook is set)")
     slack.add_argument("--no-ping", action="store_true",
                        help="Never ping the alerts channel")
+    slack.add_argument("--instance-id", metavar="NAME",
+                       help="Added to the end of every Slack message, to tell instances apart "
+                            "(env OUTLOOKER_INSTANCE_ID; settings file [options] instance-id)")
 
     watch = p.add_argument_group("monitoring service (settings file: [heartbeat])")
     watch.add_argument("--heartbeat-url", metavar="URL",
@@ -2411,8 +2590,9 @@ def setup_logging(log_file: Path, verbose: bool) -> RunLog:
 
 
 def secret_urls(args: argparse.Namespace) -> tuple:
-    """Every URL that must never appear in a post or a request body."""
-    return (args.alerts_webhook, args.logs_webhook, args.heartbeat_url, args.failure_url)
+    """Every URL and token that must never appear in a post or a request body."""
+    return (args.alerts_webhook, args.logs_webhook, args.heartbeat_url, args.failure_url,
+            args.bot_token)
 
 
 def send_run_log(args: argparse.Namespace, run_log: RunLog, exit_code: int) -> int:
