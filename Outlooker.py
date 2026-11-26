@@ -64,19 +64,21 @@ When it sends to the alerts channel
 * Every shaded area that touches the county is written to the log file.
 * An alert is sent to the alerts channel when a risk reaches its alert threshold and
   is new or has increased since the last alert for the same outlook period (see
-  "State file"). The thresholds are:
-    - categorical: Slight or higher
-    - tornado: a probability of 5% or higher (a tornado CIG never alerts on its own)
-    - hail and wind, when turned on: a probability or a CIG at or above the levels in
-      [hail] and [wind] (by default 15%, or CIG1).
+  "State file"). Every alert type and threshold is a setting: [categorical],
+  [tornado], [hail] and [wind] in the settings file each have enabled, the levels
+  that alert and the levels that ping. A blank setting uses the default:
+    - categorical: on; alerts at Slight or higher
+    - tornado: on; alerts at a probability of 5% or higher (its CIG never alerts on
+      its own)
+    - hail and wind: off; when turned on, alert at a probability of 15% or a CIG1
 * When a tornado, hail or wind risk is reported, that day's probability and CIG for
   the same hazard are both included, even if only one of them reached its threshold.
   A new or higher CIG counts as an increase in risk and sends a message.
-* The message pings the whole channel (<!channel>, Slack's syntax for @channel) when:
+* The message pings the whole channel (<!channel>, Slack's syntax for @channel) when a
+  risk reaches its ping level. By default:
     - the categorical risk is Enhanced or higher on the Day 1 or Day 2 outlook,
-    - the tornado probability is 10% or higher on any outlook, or
-    - a hail or wind probability or CIG reaches the ping level set in [hail] or [wind]
-      (by default, hail and wind never ping).
+    - the tornado probability is 10% or higher on any outlook, and
+    - hail and wind never ping.
   A ping happens once per outlook period and hazard, and again only if that risk
   increases. If a risk that was already reported reaches the ping window without
   increasing (for example a Day 3 Enhanced Risk that becomes the Day 2 outlook),
@@ -268,6 +270,8 @@ CONFIG_SETTINGS = {
     "alerts-channel": ("webhook", "ping", "report-lowered", "check-duplicates", "bot-token",
                        "channel-id", "duplicate-window"),
     "logs-channel": ("enabled", "webhook"),
+    "categorical": ("enabled", "alert-level", "ping-level", "ping-days"),
+    "tornado": HAZARD_SETTINGS,
     "hail": HAZARD_SETTINGS,
     "wind": HAZARD_SETTINGS,
     "heartbeat": ("url", "failure-url", "method"),
@@ -329,7 +333,8 @@ CATEGORY_SHORT = {
 TORNADO_LEVELS = (2, 5, 10, 15, 30, 45, 60)
 HAIL_WIND_LEVELS = (5, 15, 30, 45, 60)
 
-# Alert and ping thresholds for the categorical and tornado outlooks.
+# Default alert and ping thresholds. Each is a setting in the settings file
+# ([categorical], [tornado], [hail], [wind]); these apply when a setting is blank.
 ALERT_MIN_CATEGORY = "SLGT"
 ALERT_MIN_TORNADO = 5
 PING_MIN_CATEGORY = "ENH"
@@ -415,9 +420,21 @@ class HazardRules:
     ping_intensity: int | None
 
 
+@dataclass(frozen=True)
+class CategoricalRules:
+    """When a categorical risk is reported and when it pings the channel."""
+    alert_level: str  # a category label such as "SLGT"
+    ping_level: str | None  # None means never
+    ping_days: tuple  # outlook days on which it may ping
+
+
+CATEGORICAL_DEFAULTS = CategoricalRules(ALERT_MIN_CATEGORY, PING_MIN_CATEGORY, PING_CATEGORY_DAYS)
 TORNADO_RULES = HazardRules(ALERT_MIN_TORNADO, None, PING_MIN_TORNADO, None)
 HAIL_WIND_DEFAULTS = HazardRules(15, 1, None, None)  # when [hail] or [wind] is turned on
-DEFAULT_RULES = {TORNADO: TORNADO_RULES}  # hail and wind are checked only when turned on
+HAZARD_DEFAULTS = {TORNADO: TORNADO_RULES, HAIL: HAIL_WIND_DEFAULTS, WIND: HAIL_WIND_DEFAULTS}
+ON_BY_DEFAULT = {CATEGORICAL: True, TORNADO: True, HAIL: False, WIND: False}
+# The rules with every setting blank: hail and wind are checked only when turned on.
+DEFAULT_RULES = {CATEGORICAL: CATEGORICAL_DEFAULTS, TORNADO: TORNADO_RULES}
 
 STATE_RETENTION = timedelta(days=4)
 CHANNEL_PING = "<!channel>"
@@ -810,22 +827,25 @@ class Hazard:
         return r.alert_probability if alert else r.ping_probability
 
     def is_alertable(self, rules: dict) -> bool:
-        """Meets its alert threshold on its own. `rules` maps tornado, hail and wind to
-        their HazardRules; a hazard missing from it is not being checked."""
+        """Meets its alert threshold on its own. `rules` maps each hazard that is being
+        checked to its CategoricalRules or HazardRules."""
         if self.kind == CATEGORICAL:
-            return self.rank >= RANK[ALERT_MIN_CATEGORY]
+            r = rules.get(CATEGORICAL)
+            return r is not None and self.rank >= RANK[r.alert_level]
         limit = self._limit(rules, alert=True)
         return limit is not None and self.level >= limit
 
     def is_ping_eligible(self, rules: dict) -> bool:
         if self.kind == CATEGORICAL:
-            return self.day in PING_CATEGORY_DAYS and self.rank >= RANK[PING_MIN_CATEGORY]
+            r = rules.get(CATEGORICAL)
+            return (r is not None and r.ping_level is not None and self.day in r.ping_days
+                    and self.rank >= RANK[r.ping_level])
         limit = self._limit(rules, alert=False)
         return limit is not None and self.level >= limit
 
     @property
     def alertable(self) -> bool:
-        """Under the default rules. A tornado CIG never alerts on its own."""
+        """Under the default rules (every setting blank)."""
         return self.is_alertable(DEFAULT_RULES)
 
     @property
@@ -1738,8 +1758,8 @@ def period_key_of(expire: datetime) -> str:
 
 
 def products_to_check(rules: dict) -> list[Product]:
-    """Categorical and tornado always; hail and wind when they are turned on."""
-    return [p for p in PRODUCTS if HAZARD_OF[p.kind] == CATEGORICAL or HAZARD_OF[p.kind] in rules]
+    """The outlook files of the alert types that are turned on."""
+    return [p for p in PRODUCTS if HAZARD_OF[p.kind] in rules]
 
 
 def load_outlooks(args: argparse.Namespace, rules: dict, now: datetime
@@ -2319,10 +2339,58 @@ def location_specs(config: Config) -> list[CountySpec]:
     return specs
 
 
+# Words accepted for a categorical level, besides the labels SPC uses (TSTM ... HIGH).
+_CATEGORY_WORDS = {
+    "general thunderstorms": "TSTM", "thunderstorms": "TSTM", "marginal": "MRGL",
+    "slight": "SLGT", "enhanced": "ENH", "moderate": "MDT",
+    "1": "MRGL", "2": "SLGT", "3": "ENH", "4": "MDT", "5": "HIGH",
+}
+
+
+def _category(config: Config, key: str, default: str | None) -> str | None:
+    """A categorical level from [categorical]: "Slight", "SLGT", "Slight Risk" or "2";
+    "off" means never. Blank uses the default."""
+    value = config.text("categorical", key)
+    if value is None:
+        return default
+    word = " ".join(value.lower().split())
+    if word in ("off", "no", "none", "never"):
+        return None
+    word = word[: -len(" risk")] if word.endswith(" risk") else word
+    label = word.upper() if word.upper() in RANK else _CATEGORY_WORDS.get(word)
+    if label is None:
+        raise ConfigError(f"'{key}' in [categorical] of {config.path} must be a risk level "
+                          f"such as Marginal, Slight, Enhanced, Moderate or High (or 1-5), "
+                          f"or off; not {value!r}")
+    return label
+
+
+def categorical_rules(config: Config) -> CategoricalRules | None:
+    """The [categorical] settings, or None when it is turned off."""
+    alert = _category(config, "alert-level", CATEGORICAL_DEFAULTS.alert_level)
+    ping = _category(config, "ping-level", CATEGORICAL_DEFAULTS.ping_level)
+    days_text = config.text("categorical", "ping-days")
+    days = CATEGORICAL_DEFAULTS.ping_days
+    if days_text is not None:
+        parts = days_text.replace(",", " ").split()
+        if parts and all(part in ("1", "2", "3") for part in parts):
+            days = tuple(sorted({int(part) for part in parts}))
+        else:
+            raise ConfigError(f"'ping-days' in [categorical] of {config.path} must list outlook "
+                              f"days from 1 to 3, such as 1, 2; not {days_text!r}")
+    enabled = config.flag("categorical", "enabled")
+    if enabled is False or (enabled is None and not ON_BY_DEFAULT[CATEGORICAL]):
+        return None
+    if alert is None:
+        raise ConfigError(f"[categorical] in {config.path} is turned on, but alert-level is "
+                          "off, so it could never alert; set enabled = no instead")
+    return CategoricalRules(alert, ping, days)
+
+
 def hazard_rules(config: Config, section: str) -> HazardRules | None:
-    """The [hail] or [wind] thresholds, or None when that hazard is turned off (the
-    default). Every value is checked even when the hazard is off."""
-    defaults = HAIL_WIND_DEFAULTS
+    """The [tornado], [hail] or [wind] thresholds, or None when that hazard is turned
+    off. Every value is checked even when the hazard is off."""
+    defaults = HAZARD_DEFAULTS[section]
     highest_cig = max(INTENSITY_DEFINITIONS[INTENSITY_OF[section]])
     rules = HazardRules(
         config.threshold(section, "alert-probability", defaults.alert_probability, 100, True),
@@ -2330,7 +2398,8 @@ def hazard_rules(config: Config, section: str) -> HazardRules | None:
         config.threshold(section, "ping-probability", defaults.ping_probability, 100, True),
         config.threshold(section, "ping-intensity", defaults.ping_intensity, highest_cig, False),
     )
-    if not config.flag(section, "enabled"):
+    enabled = config.flag(section, "enabled")
+    if enabled is False or (enabled is None and not ON_BY_DEFAULT[section]):
         return None
     if rules.alert_probability is None and rules.alert_intensity is None:
         raise ConfigError(f"[{section}] in {config.path} is turned on, but alert-probability "
@@ -2376,11 +2445,17 @@ def apply_settings(args: argparse.Namespace, config: Config) -> None:
     args.cache_dir = (args.cache_dir or config.path_setting("options", "cache-dir")
                       or args.script_dir)
 
-    args.rules = dict(DEFAULT_RULES)
-    for section in (HAIL, WIND):
+    args.rules = {}
+    categorical = categorical_rules(config)
+    if categorical:
+        args.rules[CATEGORICAL] = categorical
+    for section in (TORNADO, HAIL, WIND):
         rules = hazard_rules(config, section)
         if rules:
             args.rules[section] = rules
+    if not args.rules:
+        raise ConfigError(f"every alert type is turned off in {config.path}, so nothing "
+                          "would ever be checked")
 
     args.check_duplicates = bool(config.flag("alerts-channel", "check-duplicates"))
     args.bot_token = _first(env.get("SLACK_BOT_TOKEN"), config.text("alerts-channel", "bot-token"))
