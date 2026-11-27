@@ -18,7 +18,7 @@ name: Outlooker
 
 on:
   schedule:
-    - cron: "38 * * * *"  # Every hour, 38 minutes past the hour. This is to increase the change that GitHub actions actually works. 
+    - cron: "38 4,9,20 * * *"  # Runs at 04:38, 09:38 and 20:38. 
   workflow_dispatch:
     inputs:
       mode:
